@@ -1,0 +1,4 @@
+Model,Beta,SE_HC3,CI_lo,CI_hi,Pct_Penalty,t_stat,p_value
+Model 0: Raw gap,-0.1632,0.0026,-0.1683,-0.1581,-15.0594,-62.4533,0
+Model 1: Spec 1 (Mincer core),-0.1534,0.0021,-0.1576,-0.1493,-14.2225,-72.385,0
+Model 2: Spec 2 (+ institutional),-0.15,0.0021,-0.1541,-0.1459,-13.9315,-71.3261,0

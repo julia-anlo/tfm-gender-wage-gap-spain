@@ -1,0 +1,3 @@
+dgp,estimator,n_iter,mean_est,bias,variance,rmse,coverage,pct_bias
+DGP 1: Linear,OLS,500,-0.1001,-1e-4,2e-4,0.0129,94.2,-0.1
+DGP 2: Non-Linear,OLS,500,-0.0665,0.0335,2e-4,0.0359,26.2,33.5
