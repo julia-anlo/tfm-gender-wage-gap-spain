@@ -1,0 +1,409 @@
+---
+title: "Script 03 — Oaxaca-Blinder Decomposition"
+subtitle: "TFM: Gender Wage Gap in Spain | MESIO UPC-UB | Julia Anglada Lomaeva | 2025-26"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5.5, dpi = 150)
+```
+
+```{r main}
+# =============================================================================
+# Prerequisites: run 01_preprocessing.R and 02_OLS_models.R first.
+# This script assumes df_main and spec2_formula are in the environment.
+#
+# What this script does:
+#   1. Runs the Oaxaca-Blinder decomposition using Spec 2 controls
+#   2. Uses the Neumark (1988) pooled reference — avoids the index number problem
+#   3. Breaks down the endowment and coefficient components by variable group
+#   4. Produces the three-panel decomposition figure (Figure 4.2 in TFM)
+#   5. Interprets results: is it a "what you have" or "what you get" problem?
+#
+# References:
+#   Oaxaca (1973)              — original decomposition (male reference)
+#   Blinder (1973)             — independent parallel development
+#   Neumark (1988)             — pooled reference coefficients
+#   Cotton (1988)              — weighted decomposition alternative
+#   Fortin et al. (2011)       — comprehensive review of decomposition methods
+#   De la Rica et al. (2008)   — OB applied to Spanish wage gap
+# =============================================================================
+
+library(tidyverse)
+library(oaxaca)     # oaxaca() function — the standard R implementation
+library(ggplot2)
+library(patchwork)
+
+if (!exists("df_main")) stop("Run 01_preprocessing.R first.")
+if (!exists("spec2_formula")) stop("Run 01_preprocessing.R first.")
+cat("Oaxaca-Blinder script loaded. n =", nrow(df_main), "\n\n")
+```
+
+```{r auto-load, include=FALSE}
+# Auto-load preprocessed data if not in environment
+if (!exists("df_main")) {
+  message("Running preprocessing...")
+  source("00_preprocessing.R", local = FALSE)
+}
+```
+
+
+```{r}
+# =============================================================================
+# SECTION 1: THE OB DECOMPOSITION FORMULA
+# =============================================================================
+# The oaxaca() function requires a specific formula syntax:
+#   outcome ~ controls | group_variable
+#
+# We use spec2_formula controls (the extended specification with MERCADO and
+# REGULACION) for consistency with the OLS extended model. This is important:
+# the OB decomposition decomposes EXACTLY the same gap as ols_spec2 — using
+# a different set of controls would make the results incomparable.
+#
+# The formula object created in 01_preprocessing.R uses as.formula(), which
+# oaxaca() cannot directly parse. We rebuild it here as a string formula.
+
+#equivalent to spec2_formula
+ob_rhs <- paste(
+  c("education", "tenure", "I(tenure^2)", "age_group",
+    "occupation", "sector", "contract_type", "working_day",
+    "supervisory_role", "region", "firm_size", "firm_sector",
+    "market_scope", "collective_bargaining"),
+  collapse = " + "
+)
+
+ob_formula <- as.formula(
+  paste("log_hourly_wage ~", ob_rhs, "| female")
+)
+
+df_ob <- df_main %>%
+  mutate(
+    female                = as.integer(gender == "Female"),
+    education             = as.integer(education),
+    age_group             = as.integer(age_group),
+    occupation            = as.integer(occupation),
+    sector                = as.integer(sector),
+    contract_type         = as.integer(contract_type),
+    working_day           = as.integer(working_day),
+    supervisory_role      = as.integer(supervisory_role),
+    region                = as.integer(region),
+    firm_size             = as.integer(firm_size),
+    firm_sector           = as.integer(firm_sector),
+    market_scope          = as.integer(market_scope),
+    collective_bargaining = as.integer(collective_bargaining)
+  )
+
+ob_result <- oaxaca(
+  formula       = log_hourly_wage ~ education + tenure + I(tenure^2) +
+    age_group + occupation + sector + contract_type +
+    working_day + supervisory_role + region + firm_size +
+    firm_sector + market_scope + collective_bargaining | female,
+  data          = df_ob,
+  R             = 500,
+  group.weights = NULL
+)
+
+cat("Oaxaca-Blinder formula (female = 1 for women, 0 for men):\n")
+```
+
+```{r}
+# =============================================================================
+# SECTION 2: FIT THE DECOMPOSITION
+# =============================================================================
+# group.weights: controls which wage structure is used as the counterfactual.
+#
+#   group.weights = 1   → male coefficients as reference (Oaxaca 1973)
+#   group.weights = 0   → female coefficients as reference (Blinder 1973)
+#   group.weights = NULL → Neumark (1988) pooled reference (our choice)
+#
+# Why Neumark (NULL)?
+# The "index number problem" (Oaxaca 1973, Reimers 1983): the endowment
+# and coefficient components change depending on which group's coefficients
+# are used as the counterfactual wage structure. Using male coefficients
+# overstates the endowment effect; using female coefficients understates it.
+# Neumark's solution: use the pooled regression coefficients (from a model
+# on the full sample with a gender indicator) as the counterfactual.
+# This is the most defensible and widely cited choice.
+# FIX: pass group.weights = NULL for Neumark pooled reference.
+#
+# R = 500: bootstrap replications for SEs on decomposition components.
+# ~3-5 minutes on this sample size.
+
+cat("Fitting Oaxaca-Blinder decomposition (Neumark pooled reference)...\n")
+cat("(Bootstrap R = 500 — this takes ~3-5 minutes)\n\n")
+
+set.seed(2024)
+ob_result <- oaxaca(
+  formula      = ob_formula,
+  data         = df_ob,          # FIX: use df_ob with female = 0/1
+  R            = 500,
+  group.weights= NULL            # FIX: NULL = Neumark (1988) pooled reference
+)
+
+
+cat("Decomposition complete.\n\n")
+```
+
+```{r}
+# =============================================================================
+# SECTION 3: EXTRACT AND INTERPRET RESULTS
+# =============================================================================
+
+# ── 3.1 Three-fold decomposition (overall) ───────────────────────────────────
+# The three-fold breakdown separates the gap into:
+#   Endowments:    due to compositional differences (what workers have)
+#   Coefficients:  due to wage structure differences (what the market pays)
+#   Interaction:   cross-term (would exist even with identical endowments
+#                  and identical returns — pure covariance term)
+#
+# For reporting, we collapse into two-fold by absorbing the interaction into
+# the coefficient component (following Fortin et al. 2011). This is the
+# most common reporting convention in applied economics.
+
+three_fold <- ob_result$threefold$overall
+cat("=== THREE-FOLD DECOMPOSITION ===\n")
+print(three_fold)
+
+# Extract scalars
+gap_total   <- three_fold["coef(total)"]
+gap_end   <- three_fold["coef(endowments)"]
+gap_coef  <- three_fold["coef(coefficients)"]
+gap_inter <- three_fold["coef(interaction)"]
+
+# SE from bootstrap
+se_end  <- three_fold["se(endowments)"]
+se_coef <- three_fold["se(coefficients)"]
+
+# Two-fold (absorbing interaction into coefficient component)
+gap_total    <- gap_end + gap_coef + gap_inter
+gap_unexplained <- gap_coef + gap_inter
+gap_explained   <- gap_end
+
+cat(sprintf("\n=== TWO-FOLD SUMMARY ===\n"))
+cat(sprintf("Total gap (log points):               %+.4f  (%.2f%%)\n",
+            gap_total, (exp(gap_total)-1)*100))
+cat(sprintf("  Endowment (explained):              %+.4f  | %.1f%% of total\n",
+            gap_explained, gap_explained/gap_total*100))
+cat(sprintf("  Coefficient + interaction (unexpl): %+.4f  | %.1f%% of total\n",
+            gap_unexplained, gap_unexplained/gap_total*100))
+
+# In % wage terms (exp(coefficient) - 1 approximation)
+cat(sprintf("\nIn percentage wage terms:\n"))
+cat(sprintf("  Total gap:             %.2f%%\n", (exp(gap_total) - 1) * 100))
+cat(sprintf("  Explained component:   %.2f%%\n", (exp(gap_explained) - 1) * 100))
+cat(sprintf("  Unexplained component: %.2f%%\n", (exp(gap_unexplained) - 1) * 100))
+
+
+# ── 3.2 Variable-level contribution to ENDOWMENT component ───────────────────
+# Which variables drive the compositional differences between male and female
+# workers? This tells us WHERE the human capital differences are concentrated.
+# It's a numeric matrix — convert directly using column names
+
+vars_df <- as.data.frame(ob_result$threefold$variables) %>%
+  tibble::rownames_to_column("variable") %>%
+  rename(
+    coef_end   = `coef(endowments)`,
+    se_end_var = `se(endowments)`,
+    coef_coef  = `coef(coefficients)`,
+    se_coef_var= `se(coefficients)`,
+    coef_inter = `coef(interaction)`,
+    se_inter   = `se(interaction)`
+  )
+
+# Endowment component by variable
+end_by_var <- vars_df %>%
+  filter(variable != "(Intercept)") %>%
+  arrange(desc(abs(coef_end))) %>%
+  mutate(pct_of_endowment = round(coef_end / gap_end * 100, 1))
+
+cat("=== ENDOWMENT COMPONENT — by variable ===\n")
+print(end_by_var %>% select(variable, coef_end, se_end_var, pct_of_endowment))
+
+
+# ── 3.3 Variable-level contribution to COEFFICIENT component ─────────────────
+# Which variables drive the structural differences in how the market rewards
+# male vs. female workers? This is where discrimination manifests.
+
+# Coefficient component by variable
+coef_by_var <- vars_df %>%
+  filter(variable != "(Intercept)") %>%
+  arrange(desc(abs(coef_coef))) %>%
+  mutate(pct_of_coef = round(coef_coef / gap_coef * 100, 1))
+
+cat("\n=== COEFFICIENT COMPONENT — by variable ===\n")
+print(coef_by_var %>% select(variable, coef_coef, se_coef_var, pct_of_coef))
+```
+
+```{r}
+# =============================================================================
+# SECTION 4: THE KEY DIAGNOSTIC QUESTION
+# =============================================================================
+# Is the Spanish gender pay gap a "what you have" problem (endowments)
+# or a "what you get" problem (coefficients)?
+#
+# Literature benchmark: Blau & Kahn (2017) find that for the US, the
+# coefficient component accounts for roughly 50-60% of the gap.
+# De la Rica et al. (2008) find that for Spain, the pattern differs
+# between the bottom and top of the distribution.
+# Our finding with 2022 data tests whether this has changed.
+
+pct_unexplained <- gap_unexplained / gap_total * 100
+
+cat(sprintf("\n=== DIAGNOSTIC INTERPRETATION ===\n"))
+if (pct_unexplained > 60) {
+  cat(sprintf("%.1f%% of the gap is unexplained by observable characteristics.\n",
+              pct_unexplained))
+  cat("This is a 'what you get' problem: the labour market structurally\n")
+  cat("rewards equivalent endowments differently by gender.\n")
+  cat("Policy implication: pay equity audits, promotion criteria reform.\n")
+} else if (pct_unexplained > 40) {
+  cat(sprintf("%.1f%% of the gap is unexplained — a mixed picture.\n",
+              pct_unexplained))
+  cat("Both compositional differences and structural penalties contribute.\n")
+} else {
+  cat(sprintf("%.1f%% of the gap is unexplained.\n", pct_unexplained))
+  cat("The gap is primarily compositional — endowment differences dominate.\n")
+  cat("Policy implication: focus on horizontal segregation (sector/occupation).\n")
+}
+```
+
+```{r}
+# =============================================================================
+# SECTION 5: VISUALISATIONS
+# =============================================================================
+
+# ── Figure 4.2a: Waterfall chart of two-fold decomposition ───────────────────
+waterfall_data <- tibble(
+  Component = c("Total Gap", "Explained\n(Endowments)",
+                "Unexplained\n(Coefficients + Interaction)"),
+  Value     = c(gap_total, gap_explained, gap_unexplained),
+  Fill      = c("total", "explained", "unexplained")
+)
+
+fig_waterfall <- ggplot(waterfall_data,
+                        aes(x = Component, y = (exp(Value) - 1) * 100, fill = Fill)) +
+  geom_col(width = 0.5, alpha = 0.85) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#555555") +
+  scale_fill_manual(values = c(
+    "total"       = "#1A1A2E",
+    "explained"   = "#2E75B6",
+    "unexplained" = "#C00000"
+  ), guide = "none") +
+  labs(
+    title    = "Oaxaca-Blinder Decomposition (Two-Fold)",
+    subtitle = "Neumark (1988) pooled reference | EES 2022",
+    x        = NULL,
+    y        = "% wage gap contribution"
+  ) +
+  theme_minimal(base_size = 11)
+
+# ── Figure 4.2b: Top drivers of the ENDOWMENT component ─────────────────────
+fig_endowment <- end_by_var %>%
+  slice_head(n = 10) %>%
+  ggplot(aes(x = reorder(variable, coef_end),      # ← coef → coef_end
+             y = (exp(coef_end) - 1) * 100,         # ← coef → coef_end
+             fill = coef_end > 0)) + 
+  geom_col(width = 0.65, alpha = 0.85) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#555555") +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#2E75B6", "FALSE" = "#9DC3E6"),
+                    guide = "none") +
+  labs(
+    title    = "Endowment Component by Variable",
+    subtitle = "Positive = men have more; negative = women have more",
+    x        = NULL, y = "% wage contribution"
+  ) +
+  theme_minimal(base_size = 10)
+
+# ── Figure 4.2c: Top drivers of the COEFFICIENT component ────────────────────
+fig_coefficient <- coef_by_var %>%
+  slice_head(n = 10) %>%
+  ggplot(aes(x = reorder(variable, coef_coef),      # ← coef → coef_coef
+             y = (exp(coef_coef) - 1) * 100,         # ← coef → coef_coef
+             fill = coef_coef > 0)) +  
+  geom_col(width = 0.65, alpha = 0.85) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#555555") +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#C00000", "FALSE" = "#E8B4B4"),
+                    guide = "none") +
+  labs(
+    title    = "Coefficient Component by Variable",
+    subtitle = "Negative = market undervalues female workers on this dimension",
+    x        = NULL, y = "% wage contribution"
+  ) +
+  theme_minimal(base_size = 10)
+
+fig_ob_full <- fig_waterfall / (fig_endowment | fig_coefficient)
+ggsave("fig_oaxaca_blinder_full.png", fig_ob_full,
+       width = 12, height = 10, dpi = 200)
+print(fig_ob_full)
+cat("\nSaved: fig_oaxaca_blinder_full.png\n")
+```
+
+```{r}
+# =============================================================================
+# SECTION 6: ROBUSTNESS — ALTERNATIVE REFERENCE GROUPS
+# =============================================================================
+# We report the Neumark decomposition as the main result.
+# As a robustness check, we also compute with male and female references
+# to show the range of the index number problem on this dataset.
+# If the unexplained component is large across all three references,
+# the finding is robust to this choice.
+
+cat("\nFitting alternative reference decompositions for robustness...\n")
+
+ob_male_ref <- oaxaca(ob_formula, data = df_ob, R = 200,
+                      group.weights = 1)   # male coefficients as reference
+ob_fem_ref  <- oaxaca(ob_formula, data = df_ob, R = 200,
+                      group.weights = 0)   # female coefficients as reference
+
+# Helper function to extract unexplained component from any ob object
+get_unexplained <- function(ob_obj) {
+  ov <- ob_obj$threefold$overall
+  as.numeric(ov["coef(coefficients)"]) + as.numeric(ov["coef(interaction)"])
+}
+
+robustness_refs <- tibble(
+  Reference   = c("Neumark (pooled)", "Male reference", "Female reference"),
+  Unexplained = c(
+    get_unexplained(ob_result),
+    get_unexplained(ob_male_ref),
+    get_unexplained(ob_fem_ref)
+  )
+) %>%
+  mutate(
+    Pct_of_Total = round(Unexplained / gap_total * 100, 1),
+    Pct_penalty  = round((exp(Unexplained) - 1) * 100, 2)
+  )
+
+cat("\n=== INDEX NUMBER ROBUSTNESS CHECK ===\n")
+print(robustness_refs)
+cat("(Stable % unexplained across references = robust finding)\n")
+```
+
+```{r}
+# =============================================================================
+# SECTION 7: SAVE OUTPUTS
+# =============================================================================
+
+write_csv(end_by_var,       "results_ob_endowment_by_var.csv")
+write_csv(coef_by_var,      "results_ob_coefficient_by_var.csv")
+write_csv(robustness_refs,  "results_ob_reference_robustness.csv")
+
+# Save the full OB result object for later use
+saveRDS(ob_result, "ob_result.rds")
+
+cat("\n=== SCRIPT 03 COMPLETE ===\n")
+cat("Key result:\n")
+cat(sprintf("  Total gap:     %.4f log points (%.2f%%)\n",
+            gap_total, (exp(gap_total)-1)*100))
+cat(sprintf("  Unexplained:   %.1f%% of total\n", pct_unexplained))
+cat("\nNext: source('04_DML.R')\n")
+```

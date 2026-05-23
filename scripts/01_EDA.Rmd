@@ -1,0 +1,747 @@
+---
+title: "Script 01 — Exploratory Data Analysis"
+subtitle: "TFM: Gender Wage Gap in Spain | MESIO UPC-UB | Julia Anglada Lomaeva | 2025-26"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5.5, dpi = 150)
+```
+
+#01_EDA.R — Por qué el helper raw_gap_by()
+
+La función raw_gap_by() calcula el gap para cualquier variable categórica con la misma fórmula: agrupa por la variable y por género, calcula el log-salario medio, hace pivot_wider para tener columnas Male y Female, y calcula (exp(mean_log_Female - mean_log_Male) - 1) * 100.
+
+¿Por qué exp(F-M) - 1 y no simplemente F - M? Los valores están en log-puntos. La diferencia en logs (F - M) es la diferencia logarítmica, que se interpreta directamente como el gap porcentual aproximado para gaps pequeños. Pero exp(F - M) - 1 da el cambio porcentual exacto (no aproximado). Para un gap de −16%, la diferencia entre los dos es pequeña. Para gaps mayores (como los de los outliers), importa.
+
+El RF usa as.integer(gender == "Female") en lugar del factor original porque los learners de mlr3 requieren variables numéricas. El treatment tiene que ser 0/1, no un factor — esto es un requisito técnico de DoubleMLData$new().
+
+```{r main}
+# =============================================================================
+# Prerequisites: run 01_preprocessing.R first. Needs df_main in environment.
+#
+# Column names confirmed from df_main (77 variables):
+#   Decoded: gender, education, working_day, contract_type, sector,
+#            occupation, region, age_group, firm_size, firm_sector,
+#            supervisory_role, market_scope, collective_bargaining,
+#            nationality, tenure, tenure_sq
+#   Numeric: annual_salary, annual_hours, hourly_wage, log_hourly_wage,
+#            overtime_hours
+#   Original INE codes also present but not used here
+#
+# What this script produces:
+#   Table 3.1 — Sample descriptive statistics by gender
+#   Table 3.2 — Raw wage gap by key categorical variables
+#   Fig 3.1   — Log hourly wage distribution by gender (density)
+#   Fig 3.2   — Wage distribution by gender (boxplot + violin)
+#   Fig 3.3   — Raw gap by sector (bar chart)
+#   Fig 3.4   — Raw gap by occupation (bar chart)
+#   Fig 3.5   — Raw gap by age group (profile)
+#   Fig 3.6   — Raw gap by education level
+#   Fig 3.7   — Raw gap by firm size and sector (public/private)
+#   Fig 3.8   — Tenure profile by gender
+#   Fig 3.9   — RF variable importance (validation of variable selection)
+#   Fig 3.10  — Salary pyramid by wage decile and gender
+#
+# All figures saved to: figures/ch3_eda/
+# =============================================================================
+
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(ranger)      # Random Forest for variable importance
+
+if (!exists("df_main")) stop("Run 01_preprocessing.R first.")
+cat("EDA script loaded. n =", nrow(df_main), "\n\n")
+
+dir.create("figures/ch3_eda", recursive = TRUE, showWarnings = FALSE)
+
+# Consistent palette
+COL_M    <- "#2E75B6"
+COL_F    <- "#C00000"
+COL_DARK <- "#1A1A2E"
+COL_GRAY <- "#555555"
+
+save_fig <- function(fig, name, w = 9, h = 5.5) {
+  path <- file.path("figures/ch3_eda", name)
+  ggsave(path, fig, width = w, height = h, dpi = 200, bg = "white")
+  cat("Saved:", path, "\n")
+}
+```
+
+```{r auto-load, include=FALSE}
+# Auto-load preprocessed data if not in environment
+if (!exists("df_main")) {
+  message("Running preprocessing...")
+  source("00_preprocessing.R", local = FALSE)
+}
+```
+
+
+```{r}
+# =============================================================================
+# SECTION 1: SAMPLE DESCRIPTIVE STATISTICS (Table 3.1)
+# =============================================================================
+
+cat("=== TABLE 3.1 — Descriptive Statistics by Gender ===\n\n")
+
+desc_stats <- df_main %>%
+  group_by(gender) %>%
+  summarise(
+    n                  = n(),
+    pct_sample         = round(n() / nrow(df_main) * 100, 1),
+    mean_hourly_wage   = round(mean(hourly_wage,     na.rm = TRUE), 2),
+    median_hourly_wage = round(median(hourly_wage,   na.rm = TRUE), 2),
+    sd_hourly_wage     = round(sd(hourly_wage,       na.rm = TRUE), 2),
+    mean_annual_salary = round(mean(annual_salary,   na.rm = TRUE), 0),
+    mean_log_wage      = round(mean(log_hourly_wage, na.rm = TRUE), 4),
+    mean_tenure        = round(mean(tenure,          na.rm = TRUE), 2),
+    mean_annual_hours  = round(mean(annual_hours,    na.rm = TRUE), 1),
+    pct_permanent      = round(mean(contract_type == "Permanent",
+                                    na.rm = TRUE) * 100, 1),
+    pct_fulltime       = round(mean(working_day == "Full-time",
+                                    na.rm = TRUE) * 100, 1),
+    pct_supervisor     = round(mean(supervisory_role == "Yes",
+                                    na.rm = TRUE) * 100, 1),
+    pct_university     = round(mean(education %in% c(
+      "University Diploma", "Bachelors/Masters/PhD"), na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  )
+
+print(as.data.frame(t(desc_stats)))
+
+# Raw unadjusted gap
+mean_m <- desc_stats$mean_hourly_wage[desc_stats$gender == "Male"]
+mean_f <- desc_stats$mean_hourly_wage[desc_stats$gender == "Female"]
+raw_gap_pct <- (mean_m - mean_f) / mean_m * 100
+
+cat(sprintf("\nRaw unadjusted gap: %.2f%%\n", raw_gap_pct))
+cat(sprintf("Male mean hourly wage:   %.2f\n", mean_m))
+cat(sprintf("Female mean hourly wage: %.2f\n", mean_f))
+cat(sprintf("Difference in euros:     %.2f/hour\n", mean_m - mean_f))
+
+write_csv(desc_stats, "figures/ch3_eda/table_3_1_descriptive_stats.csv")
+```
+
+```{r}
+# =============================================================================
+# SECTION 2: RAW GAP BY CATEGORICAL VARIABLES (Table 3.2)
+# =============================================================================
+
+cat("\n=== TABLE 3.2 — Raw Gap by Key Variables ===\n")
+
+# Helper: compute raw gap for any grouping variable
+raw_gap_by <- function(data, var) {
+  data %>%
+    group_by(across(all_of(var)), gender) %>%
+    summarise(mean_log = mean(log_hourly_wage, na.rm = TRUE),
+              n = n(), .groups = "drop") %>%
+    pivot_wider(names_from = gender,
+                values_from = c(mean_log, n)) %>%
+    mutate(
+      gap_pct    = round((exp(mean_log_Female - mean_log_Male) - 1) * 100, 2),
+      pct_female = round(n_Female / (n_Male + n_Female) * 100, 1)
+    ) %>%
+    rename(group = all_of(var))
+}
+
+gap_sector    <- raw_gap_by(df_main, "sector")
+gap_occ       <- raw_gap_by(df_main, "occupation")
+gap_edu       <- raw_gap_by(df_main, "education")
+gap_age       <- raw_gap_by(df_main, "age_group")
+gap_firmsize  <- raw_gap_by(df_main, "firm_size")
+gap_firmsec   <- raw_gap_by(df_main, "firm_sector")
+gap_contract  <- raw_gap_by(df_main, "contract_type")
+gap_workday   <- raw_gap_by(df_main, "working_day")
+
+cat("\nGap by firm sector (public vs private):\n")
+print(gap_firmsec %>% select(group, gap_pct, pct_female))
+
+cat("\nGap by contract type:\n")
+print(gap_contract %>% select(group, gap_pct, pct_female))
+
+cat("\nGap by working day:\n")
+print(gap_workday %>% select(group, gap_pct, pct_female))
+
+write_csv(gap_sector,   "figures/ch3_eda/table_3_2_gap_by_sector.csv")
+write_csv(gap_occ,      "figures/ch3_eda/table_3_2_gap_by_occupation.csv")
+write_csv(gap_edu,      "figures/ch3_eda/table_3_2_gap_by_education.csv")
+write_csv(gap_age,      "figures/ch3_eda/table_3_2_gap_by_age.csv")
+```
+
+```{r}
+# =============================================================================
+# SECTION 3: FIGURE 3.1 — Log Wage Distribution by Gender
+# =============================================================================
+
+cat("\nGenerating Figure 3.1...\n")
+
+# Mean lines for annotation
+means <- df_main %>%
+  group_by(gender) %>%
+  summarise(m = mean(log_hourly_wage, na.rm = TRUE), .groups = "drop")
+
+fig_3_1 <- ggplot(df_main, aes(x = log_hourly_wage, fill = gender)) +
+  geom_density(alpha = 0.55, color = NA) +
+  geom_vline(data = means,
+             aes(xintercept = m, color = gender),
+             linetype = "dashed", linewidth = 1) +
+  geom_text(data = means,
+            aes(x = m, y = Inf,
+                label = sprintf("Mean\n€%.2f/hr", exp(m)),
+                color = gender),
+            vjust = 1.8, hjust = -0.1, size = 3.2, fontface = "bold") +
+  scale_fill_manual(values  = c("Male" = COL_M, "Female" = COL_F),
+                    name    = NULL) +
+  scale_color_manual(values = c("Male" = COL_M, "Female" = COL_F),
+                     guide  = "none") +
+  scale_x_continuous(
+    labels = function(x) sprintf("€%.0f/hr", exp(x)),
+    breaks = log(c(5, 10, 15, 20, 30, 50, 80))
+  ) +
+  labs(
+    title    = "Figure 3.1 — Log Hourly Wage Distribution by Gender (EES 2022)",
+    subtitle = sprintf(
+      "Male mean: €%.2f/hr | Female mean: €%.2f/hr | Raw gap: %.1f%% | n = %s",
+      mean_m, mean_f, raw_gap_pct, format(nrow(df_main), big.mark = ",")),
+    x        = "Hourly wage (EUR, log scale)",
+    y        = "Density"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+print(fig_3_1)
+save_fig(fig_3_1, "fig_3_1_wage_distribution.png")
+```
+
+```{r}
+# =============================================================================
+# SECTION 4: FIGURE 3.2 — Boxplot + Violin
+# =============================================================================
+
+cat("Generating Figure 3.2...\n")
+
+fig_3_2 <- ggplot(df_main,
+    aes(x = gender, y = log_hourly_wage, fill = gender)) +
+  geom_violin(alpha = 0.4, color = NA, trim = TRUE) +
+  geom_boxplot(width = 0.15, alpha = 0.85, outlier.size = 0.3,
+               outlier.alpha = 0.2) +
+  scale_fill_manual(values = c("Male" = COL_M, "Female" = COL_F),
+                    guide  = "none") +
+  scale_y_continuous(
+    labels = function(x) sprintf("€%.0f", exp(x)),
+    breaks = log(c(5, 8, 12, 18, 27, 40, 60))
+  ) +
+  labs(
+    title    = "Figure 3.2 — Wage Distribution: Boxplot and Violin (EES 2022)",
+    subtitle = "Violin shows full distribution | Box shows IQR and median | Source: INE EES 2022",
+    x        = NULL,
+    y        = "Hourly wage (EUR, log scale)"
+  ) +
+  theme_minimal(base_size = 11)
+print(fig_3_2)
+save_fig(fig_3_2, "fig_3_2_boxplot_violin.png", w = 6, h = 5)
+```
+
+```{r}
+# =============================================================================
+# SECTION 5: FIGURE 3.3 — Raw Gap by Sector
+# =============================================================================
+
+cat("Generating Figure 3.3...\n")
+
+fig_3_3 <- gap_sector %>%
+  filter(!is.na(gap_pct)) %>%
+  mutate(
+    sector_short = str_wrap(str_trunc(as.character(group), 40), 40),
+    highlight    = case_when(
+      gap_pct < -15 ~ "large",
+      gap_pct < -5  ~ "moderate",
+      TRUE          ~ "small"
+    )
+  ) %>%
+  arrange(gap_pct) %>%
+  mutate(sector_short = factor(sector_short, levels = sector_short)) %>%
+  ggplot(aes(x = gap_pct, y = sector_short, fill = highlight)) +
+    geom_col(width = 0.7, alpha = 0.88) +
+    geom_vline(xintercept = 0, color = COL_DARK, linewidth = 0.5) +
+    geom_text(aes(label = sprintf("%.1f%%", gap_pct),
+                  hjust = ifelse(gap_pct < 0, 1.15, -0.15)),
+              size = 2.8, color = COL_DARK) +
+    scale_fill_manual(
+      values = c("large" = COL_F, "moderate" = "#E8A0A0", "small" = "#9DC3E6"),
+      guide  = "none") +
+    scale_x_continuous(labels = function(x) paste0(x, "%")) +
+    labs(
+      title    = "Figure 3.3 — Raw Gender Wage Gap by Sector (EES 2022)",
+      subtitle = "No controls applied | Negative = women earn less | Source: INE EES 2022",
+      x        = "Raw gender wage gap (%)",
+      y        = NULL
+    ) +
+    theme_minimal(base_size = 9) +
+    theme(panel.grid.major.y = element_blank())
+print(fig_3_3)
+save_fig(fig_3_3, "fig_3_3_gap_by_sector.png", w = 10, h = 8)
+```
+
+```{r}
+# =============================================================================
+# SECTION 6: FIGURE 3.4 — Raw Gap by Occupation
+# =============================================================================
+
+cat("Generating Figure 3.4...\n")
+
+fig_3_4 <- gap_occ %>%
+  filter(!is.na(gap_pct)) %>%
+  mutate(
+    occ_short = str_wrap(str_trunc(as.character(group), 40), 40)
+  ) %>%
+  arrange(gap_pct) %>%
+  mutate(occ_short = factor(occ_short, levels = occ_short)) %>%
+  ggplot(aes(x = gap_pct, y = occ_short,
+             fill = gap_pct < median(gap_pct, na.rm = TRUE))) +
+    geom_col(width = 0.7, alpha = 0.88) +
+    geom_vline(xintercept = 0, color = COL_DARK, linewidth = 0.5) +
+    scale_fill_manual(values = c("FALSE" = "#9DC3E6", "TRUE" = COL_F),
+                      guide  = "none") +
+    scale_x_continuous(labels = function(x) paste0(x, "%")) +
+    labs(
+      title    = "Figure 3.4 — Raw Gender Wage Gap by Occupation (EES 2022)",
+      subtitle = "No controls applied | Source: INE EES 2022",
+      x        = "Raw gender wage gap (%)",
+      y        = NULL
+    ) +
+    theme_minimal(base_size = 9) +
+    theme(panel.grid.major.y = element_blank())
+print(fig_3_4)
+save_fig(fig_3_4, "fig_3_4_gap_by_occupation.png", w = 10, h = 7)
+```
+
+```{r}
+# =============================================================================
+# SECTION 7: FIGURE 3.5 — Gap by Age Group (motherhood penalty signal)
+# =============================================================================
+
+cat("Generating Figure 3.5...\n")
+
+# Order age groups correctly
+age_order <- c("<19 years", "20-29", "30-39", "40-49", "50-59", ">59 years")
+
+fig_3_5 <- gap_age %>%
+  filter(!is.na(gap_pct)) %>%
+  mutate(group = factor(as.character(group),
+                        levels = age_order[age_order %in% as.character(group)])) %>%
+  ggplot(aes(x = group, y = gap_pct, group = 1)) +
+    geom_col(aes(fill = gap_pct < -10), width = 0.6, alpha = 0.88) +
+    geom_line(color = COL_DARK, linewidth = 1, linetype = "dashed") +
+    geom_point(size = 3.5, color = COL_DARK) +
+    geom_text(aes(label = sprintf("%.1f%%", gap_pct),
+                  vjust = ifelse(gap_pct < -10, 2.0, -0.8)),
+              size = 3.5, fontface = "bold", color = COL_DARK) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = COL_GRAY) +
+    scale_fill_manual(values = c("FALSE" = "#9DC3E6", "TRUE" = COL_F),
+                      guide  = "none") +
+    scale_y_continuous(labels = function(x) paste0(x, "%")) +
+    labs(
+      title    = "Figure 3.5 — Raw Gender Wage Gap by Age Group (EES 2022)",
+      subtitle = "Gap by career stage | Widening in 30s may signal motherhood penalty | Source: INE EES 2022",
+      x        = "Age group",
+      y        = "Raw gender wage gap (%)"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid.major.x = element_blank())
+print(fig_3_5)
+save_fig(fig_3_5, "fig_3_5_gap_by_age.png")
+```
+
+```{r}
+# =============================================================================
+# SECTION 8: FIGURE 3.6 — Gap by Education Level
+# =============================================================================
+
+cat("Generating Figure 3.6...\n")
+
+fig_3_6 <- gap_edu %>%
+  filter(!is.na(gap_pct)) %>%
+  mutate(group = factor(as.character(group),
+    levels = c("Less than Primary", "Primary Education", "Lower Secondary",
+               "Upper Secondary", "Vocational Training",
+               "University Diploma", "Bachelors/Masters/PhD"))) %>%
+  arrange(group) %>%
+  ggplot(aes(x = group, y = gap_pct, fill = gap_pct < -10)) +
+    geom_col(width = 0.65, alpha = 0.88) +
+    geom_text(aes(label = sprintf("%.1f%%\n(%.0f%% female)", gap_pct, pct_female)),
+              vjust = ifelse(gap_edu$gap_pct < 0, -0.3, 1.3),
+              size = 2.8, color = COL_DARK) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = COL_GRAY) +
+    scale_fill_manual(values = c("FALSE" = "#9DC3E6", "TRUE" = COL_F),
+                      guide  = "none") +
+    scale_x_discrete(labels = function(x) str_wrap(x, 12)) +
+    scale_y_continuous(labels = function(x) paste0(x, "%")) +
+    labs(
+      title    = "Figure 3.6 — Raw Gender Wage Gap by Education Level (EES 2022)",
+      subtitle = "Gap persists even at university level | % female shown per bar | Source: INE EES 2022",
+      x        = NULL,
+      y        = "Raw gender wage gap (%)"
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid.major.x = element_blank())
+print(fig_3_6)
+save_fig(fig_3_6, "fig_3_6_gap_by_education.png")
+```
+
+```{r}
+# =============================================================================
+# SECTION 9: FIGURE 3.7 — Gap by Firm Size and Firm Sector
+# =============================================================================
+
+cat("Generating Figure 3.7...\n")
+
+# Combined: firm_size × firm_sector (public/private)
+gap_firm_combined <- df_main %>%
+  group_by(firm_size, firm_sector, gender) %>%
+  summarise(mean_log = mean(log_hourly_wage, na.rm = TRUE),
+            n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = gender,
+              values_from = c(mean_log, n)) %>%
+  mutate(gap_pct = round((exp(mean_log_Female - mean_log_Male) - 1) * 100, 1)) %>%
+  filter(!is.na(gap_pct))
+
+fig_3_7 <- ggplot(gap_firm_combined,
+    aes(x = firm_size, y = gap_pct, fill = firm_sector)) +
+  geom_col(position = position_dodge(width = 0.7),
+           width = 0.6, alpha = 0.88) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = COL_GRAY) +
+  geom_text(aes(label = sprintf("%.1f%%", gap_pct)),
+            position = position_dodge(width = 0.7),
+            vjust = ifelse(gap_firm_combined$gap_pct < 0, -0.4, 1.4),
+            size = 3, fontface = "bold") +
+  scale_fill_manual(values = c("Private" = COL_M, "Public" = "#70AD47"),
+                    name   = "Firm sector") +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(
+    title    = "Figure 3.7 — Raw Gender Wage Gap by Firm Size and Ownership (EES 2022)",
+    subtitle = "Gap is larger in private sector and large firms — consistent with glass ceiling | Source: INE EES 2022",
+    x        = "Firm size",
+    y        = "Raw gender wage gap (%)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top",
+        panel.grid.major.x = element_blank())
+
+save_fig(fig_3_7, "fig_3_7_gap_by_firm.png", w = 8, h = 5)
+```
+
+```{r}
+# =============================================================================
+# SECTION 10: FIGURE 3.8 — Tenure Profile by Gender
+# =============================================================================
+
+cat("Generating Figure 3.8...\n")
+
+tenure_profile <- df_main %>%
+  mutate(tenure_bin = cut(tenure, breaks = c(0,2,5,10,15,20,25,30,45),
+                          include.lowest = TRUE)) %>%
+  group_by(tenure_bin, gender) %>%
+  summarise(mean_wage = mean(hourly_wage, na.rm = TRUE),
+            n = n(), .groups = "drop") %>%
+  filter(!is.na(tenure_bin))
+
+fig_3_8 <- ggplot(tenure_profile,
+    aes(x = tenure_bin, y = mean_wage,
+        color = gender, group = gender)) +
+  geom_line(linewidth = 1.3) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Male" = COL_M, "Female" = COL_F),
+                     name   = NULL) +
+  scale_y_continuous(labels = label_dollar(prefix = "€", suffix = "/hr")) +
+  scale_x_discrete(labels = function(x) str_replace_all(x, "[\\[\\](,]", " ")) +
+  labs(
+    title    = "Figure 3.8 — Mean Hourly Wage by Tenure Group and Gender (EES 2022)",
+    subtitle = "Returns to tenure are steeper for men — consistent with Mincer (1974) | Source: INE EES 2022",
+    x        = "Tenure (years)",
+    y        = "Mean hourly wage (EUR)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+save_fig(fig_3_8, "fig_3_8_tenure_profile.png")
+```
+
+```{r}
+# =============================================================================
+# SECTION 11: FIGURE 3.9 — RF Variable Importance
+# =============================================================================
+
+cat("Generating Figure 3.9 — RF Variable Importance (this takes ~2 min)...\n")
+
+# Prepare clean dataset for RF
+df_rf <- df_main %>%
+  dplyr::select(log_hourly_wage, gender, education, tenure,
+                occupation, sector, contract_type, working_day,
+                region, age_group, firm_size, firm_sector,
+                supervisory_role, market_scope, collective_bargaining) %>%
+  mutate(across(where(is.factor), as.integer),
+         gender = as.integer(gender == "Female")) %>%
+  drop_na()
+
+set.seed(2024)
+rf_fit <- ranger(
+  log_hourly_wage ~ .,
+  data        = df_rf,
+  num.trees   = 500,
+  importance  = "permutation",
+  num.threads = max(1, parallel::detectCores() - 1)
+)
+
+imp_df <- data.frame(
+  variable   = names(rf_fit$variable.importance),
+  importance = rf_fit$variable.importance
+) %>%
+  arrange(desc(importance)) %>%
+  mutate(
+    is_gender  = variable == "gender",
+    var_label  = case_when(
+      variable == "gender"                ~ "gender ← treatment",
+      variable == "education"             ~ "education",
+      variable == "tenure"                ~ "tenure",
+      variable == "occupation"            ~ "occupation",
+      variable == "sector"                ~ "sector",
+      variable == "firm_size"             ~ "firm size",
+      variable == "firm_sector"           ~ "firm sector (public/private)",
+      variable == "contract_type"         ~ "contract type",
+      variable == "working_day"           ~ "working day (FT/PT)",
+      variable == "supervisory_role"      ~ "supervisory role",
+      variable == "region"                ~ "region (NUTS-1)",
+      variable == "age_group"             ~ "age group",
+      variable == "market_scope"          ~ "market scope",
+      variable == "collective_bargaining" ~ "collective bargaining",
+      TRUE ~ variable
+    )
+  )
+
+cat(sprintf("\nRF OOB R²: %.4f\n", rf_fit$r.squared))
+cat(sprintf("Gender importance rank: %d out of %d variables\n",
+    which(imp_df$variable == "gender"), nrow(imp_df)))
+
+fig_3_9 <- ggplot(imp_df,
+    aes(x = reorder(var_label, importance),
+        y = importance,
+        fill = is_gender)) +
+  geom_col(width = 0.7, alpha = 0.88) +
+  coord_flip() +
+  scale_fill_manual(values = c("FALSE" = COL_M, "TRUE" = COL_F),
+                    guide  = "none") +
+  labs(
+    title    = "Figure 3.9 — Permutation Variable Importance (Random Forest, 500 trees)",
+    subtitle = sprintf(
+      "Outcome: log(hourly wage) | OOB R² = %.3f | Gender (red) ranks non-trivially | EES 2022",
+      rf_fit$r.squared),
+    x        = NULL,
+    y        = "Mean decrease in prediction accuracy"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid.major.y = element_blank())
+
+save_fig(fig_3_9, "fig_3_9_rf_importance.png", w = 9, h = 6)
+print(fig_3_9)
+# Save rf_fit for later use in scripts 08
+saveRDS(rf_fit, "rf_fit.rds")
+```
+
+```{r}
+# =============================================================================
+# SECTION 12: FIGURE 3.10 — Salary Pyramid
+# =============================================================================
+
+cat("Generating Figure 3.10 — Salary Pyramid...\n")
+
+pyramid_data <- df_main %>%
+  mutate(decile = ntile(hourly_wage, 10)) %>%
+  group_by(decile, gender) %>%
+  summarise(
+    n         = n(),
+    mean_wage = mean(hourly_wage, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  group_by(decile) %>%
+  mutate(
+    total    = sum(n),
+    pct      = n / total * 100,
+    pct_plot = if_else(gender == "Male", pct, -pct)
+  ) %>%
+  ungroup()
+
+decile_labels <- df_main %>%
+  mutate(decile = ntile(hourly_wage, 10)) %>%
+  group_by(decile) %>%
+  summarise(lo = round(min(hourly_wage, na.rm=TRUE), 1),
+            hi = round(max(hourly_wage, na.rm=TRUE), 1),
+            .groups = "drop") %>%
+  mutate(label = sprintf("D%02d  €%.0f–€%.0f", decile, lo, hi))
+
+pyramid_data <- pyramid_data %>%
+  left_join(decile_labels, by = "decile") %>%
+  mutate(label = factor(label, levels = decile_labels$label))
+
+pct_f_d01 <- pyramid_data$pct[pyramid_data$decile==1  & pyramid_data$gender=="Female"]
+pct_f_d10 <- pyramid_data$pct[pyramid_data$decile==10 & pyramid_data$gender=="Female"]
+cat(sprintf("Female share D01 (lowest):  %.1f%%\n", pct_f_d01))
+cat(sprintf("Female share D10 (highest): %.1f%%\n", pct_f_d10))
+
+fig_3_10 <- ggplot(pyramid_data,
+    aes(x = pct_plot, y = label, fill = gender)) +
+  geom_col(width = 0.75, alpha = 0.88) +
+  geom_vline(xintercept = 0, color = COL_DARK, linewidth = 0.6) +
+  geom_text(
+    data = pyramid_data %>% filter(abs(pct_plot) > 6),
+    aes(label = sprintf("%.0f%%", abs(pct_plot)),
+        x     = pct_plot * 0.55),
+    color = "white", size = 2.8, fontface = "bold"
+  ) +
+  scale_fill_manual(values = c("Male" = COL_M, "Female" = COL_F),
+                    name   = NULL) +
+  scale_x_continuous(
+    breaks = c(-60, -40, -20, 0, 20, 40, 60),
+    labels = function(x) paste0(abs(x), "%"),
+    limits = c(-75, 75)
+  ) +
+  annotate("text", x = -55, y = 10.5, label = "← Women",
+           color = COL_F, fontface = "bold", size = 3.5) +
+  annotate("text", x =  55, y = 10.5, label = "Men →",
+           color = COL_M, fontface = "bold", size = 3.5) +
+  labs(
+    title    = "Figure 3.10 — Wage Distribution Pyramid by Gender and Hourly Wage Decile",
+    subtitle = sprintf(
+      "Female share D01: %.0f%% | Female share D10: %.0f%% | EES 2022 | n = %s",
+      pct_f_d01, pct_f_d10, format(nrow(df_main), big.mark=",")),
+    x        = "Share of workers within each decile (%)",
+    y        = "Wage decile"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position  = "top",
+        panel.grid.major.y = element_blank(),
+        panel.grid.major.x = element_line(color = "#EEEEEE"))
+print(fig_3_10)
+save_fig(fig_3_10, "fig_3_10_salary_pyramid.png", w = 9, h = 7)
+```
+
+```{r}
+# =============================================================================
+# SECTION 13: COMBINED PANEL FOR THESIS BODY (Fig 3.11)
+# =============================================================================
+
+cat("Generating Figure 3.11 — Combined panel...\n")
+
+fig_3_11 <- (fig_3_1 | fig_3_2) /
+            (fig_3_5 | fig_3_6) +
+  plot_annotation(
+    title    = "Figure 3.11 — EDA Overview: Wage Distributions and Gap Patterns (EES 2022)",
+    subtitle = "Top: overall distributions | Bottom: gap by age group and education level",
+    theme    = theme(
+      plot.title    = element_text(size = 12, face = "bold", color = COL_DARK),
+      plot.subtitle = element_text(size = 9, color = COL_GRAY)
+    )
+  )
+print(fig_3_11)
+save_fig(fig_3_11, "fig_3_11_eda_combined.png", w = 14, h = 10)
+```
+
+```{r}
+# =============================================================================
+# SECTION 14: PRINT FULL SUMMARY FOR CHAPTER 3
+# =============================================================================
+
+cat("\n\n=== CHAPTER 3 SUMMARY — Numbers for the TFM ===\n")
+cat(sprintf("Sample size:                    n = %s\n",
+    format(nrow(df_main), big.mark=",")))
+cat(sprintf("Female workers:                 %.1f%% of sample\n",
+    mean(df_main$gender == "Female") * 100))
+cat(sprintf("Male mean hourly wage:          €%.2f\n", mean_m))
+cat(sprintf("Female mean hourly wage:        €%.2f\n", mean_f))
+cat(sprintf("Raw unadjusted gap:             %.2f%%\n", raw_gap_pct))
+cat(sprintf("RF OOB R²:                      %.4f\n", rf_fit$r.squared))
+cat(sprintf("Gender importance rank:         %d / %d variables\n",
+    which(imp_df$variable == "gender"), nrow(imp_df)))
+cat(sprintf("Female share lowest decile:     %.1f%%\n", pct_f_d01))
+cat(sprintf("Female share highest decile:    %.1f%%\n", pct_f_d10))
+
+cat("\nSector with largest gap (top 3):\n")
+gap_sector %>% arrange(gap_pct) %>% slice_head(n=3) %>%
+  select(group, gap_pct, pct_female) %>% print()
+
+cat("\nSector with smallest gap (bottom 3):\n")
+gap_sector %>% arrange(desc(gap_pct)) %>% slice_head(n=3) %>%
+  select(group, gap_pct, pct_female) %>% print()
+
+cat("\n=== SCRIPT 00_EDA COMPLETE ===\n")
+cat("All figures saved to: figures/ch3_eda/\n")
+cat("Next: check figures in RStudio Plots panel or open .png files\n")
+cat("Then: run 02_OLS_models.R\n")
+
+```
+```{r}
+df_main[,57:77] %>% head() %>% print(width = Inf) #to visualize decodified variabes only in my working dataset
+
+df_main %>%                                       #to see top 20 earners (top outliers, mostly male)
+    arrange(desc(hourly_wage)) %>%
+    select(gender, occupation, sector, hourly_wage, log_hourly_wage) %>%
+    slice_head(n = 20) %>%
+    print(width = Inf)
+
+df_main %>%                                       #to see top 30 earners (top outliers, mostly male)
+    arrange(desc(hourly_wage)) %>%
+    select(gender, occupation, sector, hourly_wage, log_hourly_wage) %>%
+    slice_head(n = 30) %>%
+    print(n= 30, width = Inf)
+
+df_main %>%
+    arrange(desc(hourly_wage)) %>%
+    slice_head(n = 100) %>%
+    group_by(gender) %>%
+    summarise(
+        n = n(),
+        pct_postgrado = mean(education == "Bachelors/Masters/PhD") * 100,
+        mean_tenure = mean(tenure)
+    )
+
+df_main %>%                                       #to see top 30 earners (top outliers pero EXTREMO INFERIOR, mostly female (16 vs 14))
+    arrange(hourly_wage) %>%
+    select(gender, occupation, sector, hourly_wage, log_hourly_wage) %>%
+    slice_head(n = 30) %>%
+    print(n=30, width = Inf)
+
+
+df_main %>%
+  arrange(hourly_wage) %>%
+  slice_head(n = 100) %>%
+  group_by(gender) %>%
+  summarise(
+    n = n(),
+    # Buscamos el rango de edad que más se repite
+    top_age_group = names(which.max(table(age_group))), 
+    pct_part_time = mean(working_day == "Part-time") * 100,
+    pct_temporary = mean(contract_type == "Temporary") * 100
+  )
+
+library(DescTools)
+
+# Gini General
+gini_total <- Gini(df_main$hourly_wage, na.rm = TRUE)
+
+# Gini por Género
+gini_genero <- df_main %>%
+  group_by(gender) %>%
+  summarise(Gini_Index = Gini(hourly_wage, na.rm = TRUE))
+
+print(gini_genero)
+```
+El análisis de los valores atípicos superiores revela una marcada infrarrepresentación femenina en los deciles más altos de ingresos. Esta asimetría sugiere la persistencia de un 'techo de cristal' que no se explica únicamente por el capital humano observable.

@@ -1,0 +1,460 @@
+---
+title: "04_dml"
+author: '"Julia Anglada Lomaeva"'
+date: "2026-04-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+# -----------------------------------------------------------------------------
+# SCRIPT 04: Double Machine Learning (DML)
+# -----------------------------------------------------------------------------
+# Prerequisites: run 01_preprocessing.R first.
+# This script assumes df_dml and spec3_confounders are in the environment.
+#
+# What this script does:
+#   1. Prepares the DML-ready dataset (integer-encoded factors for mlr3)
+#   2. Fits the PLR model with Random Forest nuisance functions (main result)
+#   3. Fits the PLR model with Lasso nuisance functions (robustness check)
+#   4. Inspects the residualisation quality (do the nuisance models work?)
+#   5. Produces the residual correlation plot (Figure 4.3 in TFM)
+#   6. Compares OLS vs DML estimates side-by-side
+#
+# References:
+#   Chernozhukov et al. (2018) — Double/debiased ML (the foundational paper)
+#   Belloni et al. (2014)      — Post-Lasso for treatment effects
+#   Breiman (2001)             — Random Forests
+#   Bach et al. (2022)         — DoubleML package documentation
+#     https://docs.doubleml.org/stable/index.html
+# =============================================================================
+
+library(tidyverse)
+library(DoubleML)       # Chernozhukov et al. (2018) implementation
+library(mlr3)           # unified ML backend
+library(mlr3learners)   # learners: ranger (RF), glmnet (Lasso)
+library(ggplot2)
+library(patchwork)
+
+if (!exists("df_dml")) stop("Run 01_preprocessing.R first.")
+cat("DML script loaded. n =", nrow(df_dml), "\n\n")
+```
+
+```{r auto-load, include=FALSE}
+# Auto-load preprocessed data if not in environment
+if (!exists("df_main")) {
+  message("Running preprocessing...")
+  source("00_preprocessing.R", local = FALSE)
+}
+```
+
+
+```{r}
+# =============================================================================
+# SECTION 1: PREPARE DML DATASET
+# =============================================================================
+# DoubleML / mlr3 requires all variables to be numeric. Factors must be
+# integer-encoded. This is a technical requirement of the mlr3 backend,
+# not a modelling choice — the RF learner handles these integers as
+# categorical splits internally.
+#
+# We keep only the variables in Spec 3 (spec3_confounders) plus the
+# outcome (log_hourly_wage) and treatment (female).
+
+dml_df <- df_dml %>%
+  mutate(
+    # Treatment: binary indicator (0 = Male, 1 = Female)
+    # Male as reference, consistent with all OLS specifications
+    female = as.integer(gender == "Female"),
+
+    # Encode all factors as integers for mlr3 compatibility
+    # Note: ordered factors (education, age_group, firm_size, market_scope)
+    # are encoded with their natural ordinal integers — the RF will learn
+    # monotone splits on these automatically.
+    across(where(is.factor), as.integer)
+  ) %>%
+  dplyr::select(
+    log_hourly_wage,      # Y: outcome
+    female,               # D: treatment
+    all_of(spec3_confounders)  # X: confounders (from 01_preprocessing.R)
+  ) %>%
+  drop_na()
+
+cat("DML dataset ready:\n")
+cat(sprintf("  Observations: %d\n", nrow(dml_df)))
+cat(sprintf("  Outcome:      log_hourly_wage\n"))
+cat(sprintf("  Treatment:    female (%.1f%% of sample)\n",
+    mean(dml_df$female) * 100))
+cat(sprintf("  Confounders:  %d variables\n", length(spec3_confounders)))
+```
+
+```{r}
+# =============================================================================
+# SECTION 2: CREATE DOUBLEML DATA OBJECT
+# =============================================================================
+# DoubleMLData$new() organises the dataset into outcome (Y), treatment (D),
+# and confounders (X). The separation is explicit — which is good practice
+# because it forces you to think about the causal structure before fitting.
+
+library(data.table)
+
+# Convert to data.table — DoubleML requires this format
+dml_df <- as.data.table(dml_df)
+
+dml_data <- DoubleMLData$new(
+  dml_df,
+  y_col  = "log_hourly_wage",
+  d_cols = "female",
+  x_cols = spec3_confounders
+)
+
+cat("\nDoubleML data object created:\n")
+print(dml_data)
+```
+
+```{r}
+# =============================================================================
+# SECTION 3: DEFINE ML LEARNERS FOR THE NUISANCE FUNCTIONS
+# =============================================================================
+# In the PLR model, we need two nuisance functions:
+#   ml_l: learner for E[Y|X] = E[log_hourly_wage | confounders]
+#   ml_m: learner for E[D|X] = E[female | confounders]
+#
+# We use the same learner for both (a common and defensible choice).
+# Random Forest is our primary learner because:
+#   (a) It handles non-linearities and high-order interactions without
+#       tuning (unlike Lasso, which needs a penalty grid)
+#   (b) It is consistent under very mild conditions (Wager & Walther 2015)
+#   (c) With 232k observations and 15 confounders, the bias from using
+#       RF is negligible — the sample size dominates
+#
+# Hyperparameter choices:
+#   num.trees = 500:  standard; more trees = less variance, diminishing returns
+#   max.depth = 6:    moderate depth — prevents overfitting while capturing
+#                     interactions (wage data has known occupation × sector
+#                     interactions that depth 6 can capture)
+#   min.node.size = 5: default for regression; keeps leaves meaningful
+#
+# We do NOT tune these hyperparameters in the main specification. The DML
+# estimator is robust to moderate nuisance model misspecification as long
+# as the cross-fitting removes the regularisation bias (Chernozhukov et al.
+# 2018, Theorem 3.1). Aggressive tuning would be gold-plating.
+
+ml_l_rf <- lrn("regr.ranger",
+  num.trees     = 500,
+  max.depth     = 6,
+  min.node.size = 5,
+  num.threads   = max(1, parallel::detectCores() - 1))
+
+ml_m_rf <- lrn("regr.ranger",
+  num.trees     = 500,
+  max.depth     = 6,
+  min.node.size = 5,
+  num.threads   = max(1, parallel::detectCores() - 1))
+
+cat("\nRF learners defined:\n")
+cat("  ml_l (E[Y|X]): regr.ranger, 500 trees, max_depth=6\n")
+cat("  ml_m (E[D|X]): regr.ranger, 500 trees, max_depth=6\n")
+```
+
+```{r}
+# =============================================================================
+# SECTION 4: FIT THE PLR MODEL (MAIN RESULT)
+# =============================================================================
+# Partially Linear Regression (PLR):
+#   Y_i = theta * D_i + g(X_i) + eps_i,   E[eps_i | D_i, X_i] = 0
+#   D_i = m(X_i) + V_i,                   E[V_i | X_i] = 0
+#
+# The DML algorithm:
+#   Step 1: Fit ml_m on K-1 folds, predict m_hat(X) on fold k
+#           Residual: V_hat_i = D_i - m_hat(X_i)
+#   Step 2: Fit ml_l on K-1 folds, predict l_hat(X) on fold k
+#           Residual: U_hat_i = Y_i - l_hat(X_i)
+#   Step 3: Regress U_hat on V_hat by OLS → theta_hat_DML
+#
+# Cross-fitting (n_folds = 5): essential. Without it, the nuisance models
+# overfit on training data and their prediction errors correlate with the
+# treatment residuals — this inflates precision and can bias the estimate.
+# 5-fold is the standard choice in the DML literature (Chernozhukov et al.
+# 2018 use K=2 in proofs; K=5 is preferred in practice for stability).
+#
+# n_rep = 3: repeat the full 5-fold CV 3 times with different splits and
+# aggregate. Reduces sensitivity to a single lucky/unlucky fold assignment.
+# With n = 232k, this is slightly cautious but costs very little time.
+
+cat("\nFitting DML (RF nuisance, 5-fold × 3 reps)...\n")
+cat("Expected time: ~5-10 minutes depending on hardware.\n\n")
+
+dml_plr_rf <- DoubleMLPLR$new(
+  dml_data,        # No name, just the object as the first argument
+  ml_l_rf,         # Second: Learner for Y (wage)
+  ml_m_rf,         # Third: Learner for D (gender)
+  n_folds = 5,
+  n_rep   = 3,
+  score   = "partialling out"
+)
+
+set.seed(2024)
+dml_plr_rf$fit(store_predictions = TRUE, store_models = FALSE)
+
+cat("\n=== DML RESULTS (Random Forest, Spec 3) ===\n")
+dml_plr_rf$summary()
+
+# Extract key scalars
+theta_rf  <- dml_plr_rf$coef["female"]
+
+se_rf     <- dml_plr_rf$se["female"]
+ci_rf     <- dml_plr_rf$confint()
+pct_rf    <- (exp(theta_rf) - 1) * 100
+
+cat(sprintf("\nMain DML estimate:\n"))
+cat(sprintf("  theta_DML (log pts): %+.4f\n", theta_rf))
+cat(sprintf("  SE:                  %.4f\n",   se_rf))
+cat(sprintf("  95%% CI:             [%.4f, %.4f]\n", ci_rf[1,1], ci_rf[1,2]))
+cat(sprintf("  %% wage penalty:     %.2f%%\n", pct_rf))
+```
+
+```{r}
+# =============================================================================
+# SECTION 5: ROBUSTNESS — LASSO NUISANCE MODELS
+# =============================================================================
+# If the DML estimate is stable across ML learner choices, that is evidence
+# it reflects the data structure rather than RF-specific modelling artifacts.
+#
+# Lasso (alpha = 1 in glmnet) is a natural comparison: it assumes approximate
+# sparsity in the nuisance functions (only a few confounders matter),
+# whereas RF makes no such assumption. If both give similar theta_hat,
+# the result is robust.
+#
+# We use the default Lasso penalty (lambda chosen by 3-fold CV within each
+# training fold of the outer 5-fold CV). This is the standard approach in
+# Belloni et al. (2014) and is implemented automatically by mlr3.
+
+cat("\nFitting DML robustness check (Lasso nuisance)...\n")
+
+ml_l_lasso <- lrn("regr.glmnet", alpha = 1)   # Lasso (L1 penalty)
+ml_m_lasso <- lrn("regr.glmnet", alpha = 1)
+
+dml_plr_lasso <- DoubleMLPLR$new(
+  dml_data,        # 1st: Data (No name)
+  ml_l_lasso,      # 2nd: Learner Y
+  ml_m_lasso,      # 3rd: Learner D
+  n_folds = 5,
+  n_rep   = 3,
+  score   = "partialling out"
+)
+
+set.seed(2024)
+cat("Fitting Lasso DML... this should be faster than Random Forest.\n")
+dml_plr_lasso$fit()
+dml_plr_lasso$summary()
+
+theta_lasso <- dml_plr_lasso$coef["female"]
+se_lasso    <- dml_plr_lasso$se["female"]
+
+cat(sprintf("\nLasso DML estimate:\n"))
+cat(sprintf("  theta_Lasso: %+.4f (%.2f%% penalty)\n",
+    theta_lasso, (exp(theta_lasso)-1)*100))
+cat(sprintf("  Difference from RF: %.4f log points\n",
+    abs(theta_rf - theta_lasso)))
+
+if (abs(theta_rf - theta_lasso) < 0.01) {
+  cat("  --> Estimates agree within 1 log point: ROBUST to learner choice.\n")
+} else {
+  cat("  --> Non-trivial difference: worth investigating nuisance fit quality.\n")
+}
+```
+
+```{r}
+# =============================================================================
+# SECTION 6: NUISANCE MODEL QUALITY CHECK
+# =============================================================================
+# How well do the nuisance models actually predict Y and D from X?
+# This is not about the DML estimate per se, but it tells us whether
+# the partialling-out is doing meaningful work.
+#
+# If R²(E[Y|X]) is very high → the confounders explain most wage variance
+#   → the residuals are tight → the DML estimate is precise
+# If R²(E[D|X]) is very high → gender is highly predictable from observables
+#   → the residualised treatment has little variance → wide CI on theta
+#
+# We extract these from the stored predictions.
+
+# Get predictions from the first rep, first fold (indicative)
+preds_l <- dml_plr_rf$predictions$ml_l  # predicted E[Y|X] — array [n, n_rep, n_folds]
+preds_m <- dml_plr_rf$predictions$ml_m  # predicted E[D|X]
+
+# Average across reps for the quality metrics
+y_hat_mean <- apply(preds_l, 1, mean, na.rm = TRUE)
+d_hat_mean <- apply(preds_m, 1, mean, na.rm = TRUE)
+
+# Compute out-of-fold R²
+y_true <- dml_df$log_hourly_wage
+d_true <- dml_df$female
+
+r2_y <- 1 - sum((y_true - y_hat_mean)^2, na.rm=TRUE) /
+            sum((y_true - mean(y_true))^2, na.rm=TRUE)
+r2_d <- 1 - sum((d_true - d_hat_mean)^2, na.rm=TRUE) /
+            sum((d_true - mean(d_true))^2, na.rm=TRUE)
+
+cat(sprintf("\n=== NUISANCE MODEL QUALITY (out-of-fold) ===\n"))
+cat(sprintf("  E[Y|X] R² (wage model):   %.4f\n", r2_y))
+cat(sprintf("  E[D|X] R² (gender model): %.4f\n", r2_d))
+cat(sprintf("  (R² > 0.5 for wages is typical; R² for binary D is usually lower)\n"))
+
+# Residuals: the quantities that theta_DML is actually estimated from
+u_hat <- y_true - y_hat_mean   # residualised wage
+v_hat <- d_true - d_hat_mean   # residualised gender
+
+cat(sprintf("\n  Var(V_hat) / Var(D):  %.4f  (share of treatment variance left after partialling)\n",
+    var(v_hat, na.rm=TRUE) / var(d_true, na.rm=TRUE)))
+cat(sprintf("  Cor(V_hat, U_hat):    %.4f  (raw correlation driving theta_DML)\n",
+    cor(v_hat, u_hat, use="complete.obs")))
+
+
+# ── Residual scatterplot — Figure 4.3 ────────────────────────────────────────
+# The DML estimate theta_hat is the slope of U_hat on V_hat.
+# Showing this scatterplot makes the "partialling out" intuition concrete.
+# We sample 10,000 points for the plot (full dataset is too dense to read).
+
+set.seed(42)
+idx_sample <- sample(length(u_hat), min(10000, length(u_hat)))
+
+resid_df <- tibble(
+  v_hat = v_hat[idx_sample],
+  u_hat = u_hat[idx_sample]
+)
+
+fig_residuals <- ggplot(resid_df, aes(x = v_hat, y = u_hat)) +
+  geom_point(alpha = 0.08, size = 0.5, color = "#2E75B6") +
+  geom_smooth(method = "lm", se = TRUE, color = "#C00000",
+              fill = "#C00000", alpha = 0.15, linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#555555") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "#555555") +
+  labs(
+    title    = "DML Residual Regression: U_hat on V_hat",
+    subtitle = sprintf(
+      "Slope = theta_DML = %.4f (%.2f%% penalty) | n = %d (sample)",
+      theta_rf, pct_rf, length(idx_sample)),
+    x        = "V_hat = Female - E[Female | X]   (residualised treatment)",
+    y        = "U_hat = log(wage) - E[log(wage) | X]   (residualised outcome)"
+  ) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.5, size = 3.5,
+           color = "#C00000",
+           label = sprintf("theta = %.4f\nSE = %.4f", theta_rf, se_rf)) +
+  theme_minimal(base_size = 11)
+
+print(fig_residuals)
+
+ggsave("fig_dml_residuals.png", fig_residuals, width = 8, height = 5, dpi = 200)
+cat("\nSaved: fig_dml_residuals.png\n")
+```
+
+```{r}
+# =============================================================================
+# SECTION 7: OLS vs DML COMPARISON
+# =============================================================================
+# The gap between the OLS Spec 2 estimate and theta_DML is analytically
+# informative: it bounds the combined effect of functional form
+# misspecification and unmodelled confounders in the OLS regression.
+# A large gap suggests OLS was picking up non-linear confounding.
+# A small gap is reassuring: the linear approximation was adequate.
+
+if (exists("ols_spec2") && exists("vcov_spec2")) {
+  b_ols  <- coef(ols_spec2)["genderFemale"]
+  se_ols <- sqrt(vcov_spec2["genderFemale","genderFemale"])
+
+  comparison <- tibble(
+    Method  = c("OLS Spec 1 (Mincer core)",
+                "OLS Spec 2 (+ institutional)",
+                "DML RF (Spec 3)",
+                "DML Lasso (Spec 3)"),
+    Theta   = c(coef(ols_spec1)["genderFemale"],
+                b_ols,
+                theta_rf,
+                theta_lasso),
+    SE      = c(sqrt(vcov_spec1["genderFemale","genderFemale"]),
+                se_ols,
+                se_rf,
+                se_lasso)
+  ) %>%
+    mutate(
+      Pct_Penalty = round((exp(Theta)-1)*100, 2),
+      CI_lo       = round(Theta - 1.96*SE, 4),
+      CI_hi       = round(Theta + 1.96*SE, 4)
+    )
+
+  cat("\n=== OLS vs DML COMPARISON (Table 5.1 in TFM) ===\n")
+  print(comparison)
+
+  # How much does DML reduce the estimate vs OLS?
+  reduction <- (abs(b_ols) - abs(theta_rf)) / abs(b_ols) * 100
+  cat(sprintf("\nDML reduces the gender penalty estimate by %.1f%% vs OLS Spec 2.\n",
+      reduction))
+  cat(sprintf("Interpretation: %.1f%% of the OLS estimate was driven by\n",
+      reduction))
+  cat("non-linear confounding that the linear controls could not absorb.\n")
+
+  write_csv(comparison, "results_ols_vs_dml_comparison.csv")
+
+  # Coefficient comparison plot
+  fig_compare <- ggplot(comparison,
+      aes(x = reorder(Method, -abs(Theta)), y = Pct_Penalty)) +
+    geom_point(size = 4, aes(color = grepl("DML", Method))) +
+    geom_errorbar(
+      aes(ymin = (exp(CI_lo)-1)*100, ymax = (exp(CI_hi)-1)*100,
+          color = grepl("DML", Method)),
+      width = 0.25, linewidth = 0.8
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "#555555") +
+    scale_color_manual(values = c("FALSE"="#2E75B6","TRUE"="#C00000"),
+                       guide = "none") +
+    coord_flip() +
+    labs(
+      title    = "Gender Wage Penalty: OLS vs DML (95% CI)",
+      subtitle = "Red = DML estimates | Blue = OLS estimates | EES 2022",
+      x        = NULL,
+      y        = "% wage penalty for female workers"
+    ) +
+    theme_minimal(base_size = 11)
+  ggsave("fig_ols_vs_dml.png", fig_compare, width = 9, height = 4, dpi = 200)
+  cat("Saved: fig_ols_vs_dml.png\n")
+}
+print(fig_compare)
+```
+
+```{r}
+# =============================================================================
+# SECTION 8: SAVE OUTPUTS
+# =============================================================================
+
+saveRDS(dml_plr_rf,    "dml_plr_rf.rds")
+saveRDS(dml_plr_lasso, "dml_plr_lasso.rds")
+
+dml_summary <- tibble(
+  Model       = c("DML RF (main)", "DML Lasso (robustness)"),
+  Theta       = c(theta_rf, theta_lasso),
+  SE          = c(se_rf, se_lasso),
+  Pct_Penalty = c(pct_rf, (exp(theta_lasso)-1)*100),
+  CI_lo       = c(ci_rf[1,1], dml_plr_lasso$confint()[1,1]),
+  CI_hi       = c(ci_rf[1,2], dml_plr_lasso$confint()[1,2])
+)
+write_csv(dml_summary, "results_dml_main.csv")
+
+cat("\n=== SCRIPT 04 COMPLETE ===\n")
+cat(sprintf("Main result: theta_DML = %.4f (%.2f%% penalty)\n",
+    theta_rf, pct_rf))
+cat("\nNext: source('05_monte_carlo.R')\n")
+
+```
+
+

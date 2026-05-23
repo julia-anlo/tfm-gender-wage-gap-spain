@@ -1,0 +1,716 @@
+---
+title: "Script 00 — Data Preprocessing & Variable Engineering"
+subtitle: "TFM: Gender Wage Gap in Spain | MESIO UPC-UB | Julia Anglada Lomaeva | 2025-26"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5.5, dpi = 150)
+```
+
+##00_preprocessing.R — Por qué cada decisión
+
+### Tablas de decodificación: El INE entrega los microdatos con códigos numéricos/alfanuméricos (SEXO=1 para hombre, SEXO=6 para mujer). El 6 para mujer es un código poco intuitivo que causa errores silenciosos si no se documenta. Cada left_join mapea un código INE a una etiqueta interpretable en inglés. Los left_join en lugar de mutate/case_when son más legibles y más fáciles de verificar que las etiquetas sean correctas.
+
+### Type harmonization: Todos los códigos INE se convierten a character antes del join. Si los códigos son numéricos en el raw data y character en la tabla de decodificación, el left_join falla silenciosamente (sin error, pero todas las filas quedan NA). Es uno de los bugs más difíciles de detectar. El código lo documenta explícitamente con el comentario # Silent type mismatches cause rows to silently drop.
+
+### Filtrado de observaciones: Se eliminan salarios por hora < €2 (aproximadamente 0.3% de la muestra). El SMI de 2022 era €7.47/hr pero se usa €2 como corte conservador porque algunos contratos legítimos (becarios, contratos de aprendizaje) pueden estar por debajo del SMI. El filtro de €400 anuales elimina contratos de muy corta duración (días en el mes de referencia de octubre) que distorsionarían el hourly wage al dividir por horas anuales.
+
+### Factor encoding: El factor gender se define con levels = c("Male", "Female") para que Male sea la referencia. En R, el primer nivel de un factor es la referencia en regresión. Esto es estándar en la literatura de wage gap: el coeficiente de genderFemale representa la penalización salarial femenina relativa al hombre.
+
+### Listwise deletion: Se aplica solo a las variables del modelo principal. Las variables de robustness check (nationality, solo para DML) no entran en la eliminación principal para preservar el mayor n posible para OLS y OB.
+
+```{r main}
+# =============================================================================
+# TFM — Gender Wage Gap in Spain
+# MESIO UPC-UB | Julia Anglada Lomaeva | 2025-26
+# -----------------------------------------------------------------------------
+# SCRIPT 01: Variable Selection, Decoding & Preprocessing
+# -----------------------------------------------------------------------------
+# This script does three things in order:
+#   1. Decodes ALL relevant INE codes into interpretable English labels
+#   2. Engineers the dependent variable (log hourly wage)
+#   3. Builds THREE nested model specifications:
+#        Spec 1 → OLS Baseline (Mincer core, 12 controls)
+#        Spec 2 → OLS Extended + Oaxaca-Blinder (adds MERCADO + REGULACION)
+#        Spec 3 → DML (all of Spec 2 + TIPOPAIS nationality control)
+#
+# Variable selection rationale is documented inline with academic references.
+# Excluded variables are listed explicitly with reasons — the tribunal will ask.
+# =============================================================================
+
+library(tidyverse)
+
+# Load raw EES 2022 microdata
+# Source: INE, Encuesta de Estructura Salarial 2022
+# https://www.ine.es/dyngs/INEbase/es/operacion.htm?c=Estadistica_C&cid=1254736177025
+load("~/Downloads/datos_2022/R/EES_2022.RData")
+df_raw <- Microdatos
+
+head(df_raw)
+summary(df_raw)
+
+cat("Raw dataset loaded:", nrow(df_raw), "observations,", ncol(df_raw), "variables\n")
+```
+
+```{r}
+# =============================================================================
+# SECTION 1: DECODING TABLES
+# =============================================================================
+# The INE releases EES microdata with numeric/alphanumeric codes. Every join
+# below maps those codes to interpretable English labels following the official
+# INE design record (dr_EES_2022.xlsx, sheets "Diseño", "Tablas1", "Tablas2").
+# All mapping tables are built from the official INE code dictionaries.
+# =============================================================================
+
+# ── 1.1 Gender (SEXO → TSexo) ──────────────────────────────────────────────
+# Codes: 1 = Hombre, 6 = Mujer
+# Note: INE uses 1/6 (not 1/2) — a common source of silent merge failures
+# Reference level: Male (standard in wage gap literature, Blau & Kahn 2017)
+appendix_gender <- tibble(
+  INE_Code = c("1", "6"),
+  gender   = c("Male", "Female")
+)
+
+# ── 1.2 Education (ESTU → TTitula) ─────────────────────────────────────────
+# 7 ordered levels from ISCED classification
+# Ordered factor: tells OLS and RF that Bachelor > Primary (not just different)
+# Human capital theory: Mincer (1974), Goldin (2014)
+appendix_education <- tibble(
+  INE_Code  = as.character(1:7),
+  education = c(
+    "Less than Primary",        # ISCED 0
+    "Primary Education",        # ISCED 1
+    "Lower Secondary",          # ISCED 2
+    "Upper Secondary",          # ISCED 3
+    "Vocational Training",      # ISCED 4/5 — FP Grado Superior
+    "University Diploma",       # ISCED 6 — Diplomatura (3-year degree)
+    "Bachelors/Masters/PhD"     # ISCED 7 — Grado/Máster/Doctorado
+  )
+)
+
+# ── 1.3 Working Day Type (TIPOJOR → TJornad) ───────────────────────────────
+# 1 = Full-time, 2 = Part-time
+# IMPORTANT: we build log_hourly_wage (= log(RETRINOIN / JAP)) as the
+# dependent variable, which already controls for hours in a continuous,
+# precise way. TIPOJOR is then a label for contract modality, not hours.
+# Including both log_hourly_wage AND TIPOJOR is fine — they capture different
+# things (hourly price vs. contract type). See Goldin (2014) on part-time
+# penalties operating beyond the pure hours effect.
+appendix_working_day <- tibble(
+  INE_Code    = c("1", "2"),
+  working_day = c("Full-time", "Part-time")
+)
+
+# ── 1.4 Contract Type (TIPOCON → TContra) ──────────────────────────────────
+# 1 = Indefinite (permanent), 2 = Fixed-term (temporary)
+# Temporary contracts are associated with lower wages and higher female
+# incidence in Spain. Dolado et al. (2002) document the "dual labour market"
+# penalty in the Spanish context — one of the largest in the OECD.
+appendix_contract_type <- tibble(
+  INE_Code      = c("1", "2"),
+  contract_type = c("Permanent", "Temporary")
+)
+
+# ── 1.5 Sector (CNACE → TCNAE) ─────────────────────────────────────────────
+# 27 CNAE-2009 aggregated groups (B0 through S0)
+# Horizontal occupational segregation by sector is one of the two main
+# mechanisms explaining the Spanish gender wage gap (De la Rica et al. 2008).
+# These groups follow the official EES aggregation, not full CNAE 2-digit.
+appendix_sector <- tibble(
+  INE_Code = c("B0","C1","C2","C3","C4","C5","C6","C7","C8",
+               "D0","E0","F0","G1","G2","H1","H2","I0","J0",
+               "K0","L0","M0","N0","O0","P0","Q0","R0","S0"),
+  sector   = c(
+    "Mining and Quarrying",
+    "Manufacturing: Food, Textiles and Leather",
+    "Manufacturing: Wood and Paper",
+    "Manufacturing: Printing",
+    "Manufacturing: Chemical and Pharma",
+    "Manufacturing: Non-metallic Mineral Products",
+    "Manufacturing: Metallurgy and Metal Products",
+    "Manufacturing: IT, Electronics and Machinery",
+    "Manufacturing: Vehicles and Furniture",
+    "Electricity, Gas and Steam Supply",
+    "Water Supply and Waste Management",
+    "Construction",
+    "Wholesale Trade and Motor Vehicles",
+    "Retail Trade",
+    "Transport (Land, Water, Air)",
+    "Warehousing and Postal Activities",
+    "Hospitality (Accommodation and Food)",
+    "Information and Communications (ICT)",
+    "Financial and Insurance Activities",
+    "Real Estate Activities",
+    "Professional, Scientific and Technical Activities",
+    "Administrative and Support Services",
+    "Public Administration and Social Security",
+    "Education",
+    "Human Health and Social Work Activities",
+    "Arts, Entertainment and Recreation",
+    "Other Service Activities"
+  )
+)
+
+# ── 1.6 Occupation (CNO1 → TCNO) ───────────────────────────────────────────
+# 17 CNO-2011 major groups (A0 through Q0)
+# Vertical segregation by occupation is the second key mechanism in the
+# Spanish wage gap literature (De la Rica et al. 2008, Muñoz-Bullón 2010).
+# The glass ceiling manifests precisely in the underrepresentation of women
+# at the top of this classification (group A0: Managers and Directors).
+appendix_occupation <- tibble(
+  INE_Code   = c("A0","B0","C0","D0","E0","F0","G0","H0","I0",
+                 "J0","K0","L0","M0","N0","O0","P0","Q0"),
+  occupation = c(
+    "Managers and Directors",
+    "Health and Education Professionals",
+    "Science and Engineering Professionals",
+    "Associate Professionals",
+    "Office Clerks (Back Office)",
+    "Customer Service Clerks",
+    "Sales and Catering Workers",
+    "Health and Care Services",
+    "Protective and Security Services",
+    "Skilled Agri, Forest and Fishery",
+    "Skilled Construction Workers",
+    "Skilled Manufacturing Workers",
+    "Stationary Plant and Machine Operators",
+    "Mobile Plant Operators and Drivers",
+    "Elementary Service Occupations",
+    "Elementary Laborers (Agri/Const/Manuf)",
+    "Armed Forces"
+  )
+)
+
+# ── 1.7 Region (NUTS1 → TNUTS) ─────────────────────────────────────────────
+# 7 NUTS-1 macro-regions
+# Spain's regional labour markets differ substantially in industrial
+# composition, unionisation rates and wage levels (Simón et al. 2008).
+# The NUTS-1 aggregation is a reasonable compromise between regional
+# granularity and sample size per cell in the regression.
+appendix_region <- tibble(
+  INE_Code = as.character(1:7),
+  region   = c(
+    "Northwest",        # Galicia, Asturias, Cantabria
+    "Northeast",        # País Vasco, Navarra, La Rioja, Aragón
+    "Madrid",           # Comunidad de Madrid
+    "Center",           # Castilla y León, Castilla-La Mancha, Extremadura
+    "East",             # Cataluña, Valencia, Baleares
+    "South",            # Andalucía, Murcia, Ceuta, Melilla
+    "Canary Islands"    # Canarias
+  )
+)
+
+# ── 1.8 Age Group (ANOS2 → TEdad) ──────────────────────────────────────────
+# 6 age cohorts — ordered factor (younger < older)
+# Age proxies general labour market experience when firm tenure is also
+# included, following the two-component experience decomposition in
+# Topel (1991): total experience = general + firm-specific.
+appendix_age <- tibble(
+  INE_Code  = c("01","02","03","04","05","06"),
+  age_group = c("<19 years", "20-29", "30-39", "40-49", "50-59", ">59 years")
+)
+
+# ── 1.9 Firm Size (ESTRATO2 → TTrabaj) ─────────────────────────────────────
+# 3 strata: Small (1-49), Medium (50-199), Large (≥200)
+# Larger firms pay more on average (size-wage premium, Oi & Idson 1999) and
+# have more formalised HR practices that may reduce discriminatory pay.
+# Muñoz-Bullón & Sánchez-Bueno (2011) show firm size is a significant
+# predictor of the gender gap in Spain.
+appendix_firm_size <- tibble(
+  INE_Code  = c("1", "2", "3"),
+  firm_size = c("Small (1-49)", "Medium (50-199)", "Large (>200)")
+)
+
+# ── 1.10 Firm Sector / Ownership (CONTROL → TContro) ───────────────────────
+# 1 = Public, 2 = Private
+# The gender pay gap is systematically smaller in the public sector due to
+# transparent pay scales and formalised grading systems (Christofides &
+# Pashardes 2002). Including this variable is standard in Spanish wage gap
+# studies (Palencia et al. 2014).
+appendix_firm_sector <- tibble(
+  INE_Code    = c("1", "2"),
+  firm_sector = c("Public", "Private")
+)
+
+# ── 1.11 Supervisory Role (RESPONSA → T1Sino) ──────────────────────────────
+# 0 = No supervisory responsibility, 1 = Yes
+# Controls for within-occupation hierarchy — the glass ceiling operates
+# precisely here. Without this control, part of the glass ceiling effect
+# would be absorbed into the occupation fixed effect, understating the
+# direct gender penalty at the top of hierarchies.
+appendix_supervisory <- tibble(
+  INE_Code         = c("1", "0"),
+  supervisory_role = c("Yes", "No")
+)
+
+# ── 1.12 NEW: Market Scope (MERCADO → TMercad) ─────────────────────────────
+# 1=Local/Regional, 2=National, 3=EU, 4=Global
+# Exporting firms pay wage premiums (exporter wage premium, Bernard &
+# Jensen 1999), and these premiums are distributed unequally by gender:
+# Zweimüller et al. (2008) and Blau & Kahn (2017) show that the gender gap
+# is larger in internationally competitive firms, where performance-related
+# pay — which disadvantages women on average — plays a greater role.
+# This is one of the EES-specific variables not available in most datasets.
+appendix_market <- tibble(
+  INE_Code     = c("1", "2", "3", "4"),
+  market_scope = c("Local/Regional", "National", "European Union", "Global")
+)
+
+# ── 1.13 NEW: Collective Bargaining Level (REGULACION → TRegula) ────────────
+# 1=National sector, 2=Regional/provincial sector, 3=Company, 4=Workplace, 5=Other
+# Card, Cardoso & Kline (2016) show that collective bargaining structure
+# explains 20-30% of between-firm wage variance. In Spain specifically,
+# company-level agreements (codes 3-4) give firms substantially more
+# discretion to set discretionary pay supplements — which is precisely where
+# gender discrimination operates (Izquierdo et al. 2003, Bentolila &
+# Saint-Paul 1992). We collapse into a binary: centralised (1-2) vs.
+# decentralised (3-5), following the approach in Simón et al. (2008).
+appendix_bargaining <- tibble(
+  INE_Code             = as.character(1:5),
+  collective_bargaining = c(
+    "Centralised",      # 1: National/sectorial estatal
+    "Centralised",      # 2: Regional/provincial sector
+    "Decentralised",    # 3: Company or group agreement
+    "Decentralised",    # 4: Workplace agreement
+    "Decentralised"     # 5: Other (typically firm-specific)
+  )
+)
+
+# ── 1.14 NEW: Nationality (TIPOPAIS → TPais) ───────────────────────────────
+# 1 = Spain, 2 = Rest of world
+# Used ONLY in Spec 3 (DML robustness). Immigrant workers have systematically
+# different wage profiles for reasons unrelated to gender discrimination
+# (selection into migration, language barriers, credential recognition).
+# Including it prevents the gender estimator from picking up immigrant-female
+# overlap effects. NOT included in OLS main specifications because the binary
+# variable is too coarse to capture immigrant heterogeneity — it would absorb
+# variance without adding clean identification (Amuedo-Dorantes & De la Rica 2007).
+appendix_nationality <- tibble(
+  INE_Code    = c("1", "2"),
+  nationality = c("Spanish", "Foreign")
+)
+```
+
+```{r}
+# =============================================================================
+# SECTION 2: TYPE HARMONIZATION
+# =============================================================================
+# All INE codes in the microdata must be character before joining.
+# Silent type mismatches (numeric vs. character) cause rows to silently drop
+# from left_joins — the worst kind of bug because the dataset looks fine.
+# =============================================================================
+
+df_typed <- df_raw %>%
+  mutate(across(
+    c(SEXO, ESTU, TIPOJOR, TIPOCON, CNACE, CNO1,
+      NUTS1, ANOS2, ESTRATO2, CONTROL, RESPONSA,
+      MERCADO, REGULACION, TIPOPAIS),
+    as.character
+  ))
+
+cat("Type harmonization complete.\n")
+
+
+# =============================================================================
+# SECTION 3: JOIN ALL MAPPING TABLES
+# =============================================================================
+
+df_decoded <- df_typed %>%
+  left_join(appendix_gender,     by = c("SEXO"      = "INE_Code")) %>%
+  left_join(appendix_education,  by = c("ESTU"      = "INE_Code")) %>%
+  left_join(appendix_working_day,by = c("TIPOJOR"   = "INE_Code")) %>%
+  left_join(appendix_contract_type, by = c("TIPOCON" = "INE_Code")) %>%
+  left_join(appendix_sector,     by = c("CNACE"     = "INE_Code")) %>%
+  left_join(appendix_occupation, by = c("CNO1"      = "INE_Code")) %>%
+  left_join(appendix_region,     by = c("NUTS1"     = "INE_Code")) %>%
+  left_join(appendix_age,        by = c("ANOS2"     = "INE_Code")) %>%
+  left_join(appendix_firm_size,  by = c("ESTRATO2"  = "INE_Code")) %>%
+  left_join(appendix_firm_sector,by = c("CONTROL"   = "INE_Code")) %>%
+  left_join(appendix_supervisory,by = c("RESPONSA"  = "INE_Code")) %>%
+  left_join(appendix_market,     by = c("MERCADO"   = "INE_Code")) %>%
+  left_join(appendix_bargaining, by = c("REGULACION"= "INE_Code")) %>%
+  left_join(appendix_nationality,by = c("TIPOPAIS"  = "INE_Code"))
+
+# Verify join quality — any unmatched codes appear as NAs
+cat("\nJoin quality check (NAs per key variable):\n")
+key_vars <- c("gender","education","working_day","contract_type","sector",
+              "occupation","region","age_group","firm_size","firm_sector",
+              "supervisory_role","market_scope","collective_bargaining","nationality")
+for (v in key_vars) {
+  n_na <- sum(is.na(df_decoded[[v]]))
+  pct  <- round(n_na / nrow(df_decoded) * 100, 2)
+  cat(sprintf("  %-25s: %6d NAs (%s%%)\n", v, n_na, pct))
+}
+
+
+# =============================================================================
+# SECTION 4: DEPENDENT VARIABLE ENGINEERING
+# =============================================================================
+
+df_engineered <- df_decoded %>%
+  mutate(
+    # Gross annual salary (non-IT related) — the standard wage measure in EES
+    # RETRINOIN: "Salario Bruto Anual No Derivado de IT"
+    # We exclude RETRIIN (IT-derived salary) because incapacity spells
+    # introduce a selection mechanism unrelated to structural wage-setting.
+    annual_salary = as.numeric(RETRINOIN),
+
+    # Annual pacted working hours — used to construct the hourly wage
+    # JAP: "Jornada Anual Pactada"
+    annual_hours = as.numeric(JAP),
+
+    # Hourly wage: removes the part-time confound
+    # Without this division, total annual earnings conflate hourly price
+    # with hours worked — and women work part-time at ~4x the rate of men
+    # in Spain (Eurostat LFS 2022), creating a mechanical downward bias
+    # in any gender coefficient on annual wages.
+    hourly_wage = annual_salary / annual_hours,
+
+    # Log transformation: standard in wage regression since Mincer (1974)
+    # Rationale: (1) approximates log-normality of wages; (2) stabilises
+    # variance; (3) renders coefficients interpretable as % differentials
+    # via exp(beta) - 1.
+    log_hourly_wage = log(hourly_wage),
+
+    # Firm tenure in years — the key human capital variable for firm-specific
+    # experience (Topel 1991). ANOANTI is already numeric; we just rename.
+    tenure = as.numeric(ANOANTI),
+
+    # Tenure squared — captures the concave returns to experience
+    # (rising then flattening wage-tenure profile). Without this term,
+    # OLS linearly extrapolates experience returns, which is empirically
+    # wrong and introduces systematic residual patterns.
+    tenure_sq = tenure^2,
+
+    # Overtime hours — used for descriptive purposes only, NOT in models
+    # (it is partly endogenous to sector and occupation)
+    overtime_hours = as.numeric(HEXTRA)
+  )
+```
+
+```{r}
+# =============================================================================
+# SECTION 5: FILTERING
+# =============================================================================
+# Two principled exclusion criteria. Both are documented so the tribunal can
+# see exactly what fraction of observations is affected.
+
+n_before <- nrow(df_engineered)
+
+df_filtered <- df_engineered %>%
+  filter(
+    # Exclude implausible annual salaries below €400
+    # Rationale: these represent data entry errors, very short employment
+    # spells (a few days in October with partial salary), or administrative
+    # records that do not reflect a wage relationship. €400 corresponds to
+    # roughly one week at minimum wage — a conservative lower bound.
+    annual_salary > 400,
+
+    # Exclude implausible hourly wages below €2
+    # Rationale: the 2022 Spanish minimum wage (SMI) was €7.47/hour for
+    # full-time workers. Values below €2 indicate either JAP coding errors
+    # or the same short-spell issue above. We use €2 rather than SMI to
+    # be conservative — some legitimate cases (traineeships, special
+    # contracts for young workers) may fall between €2 and €7.47.
+    hourly_wage > 2,
+
+    # Exclude zero or negative hourly wages (log undefined)
+    hourly_wage > 0,
+
+    # Exclude missing annual hours (cannot construct hourly wage)
+    !is.na(annual_hours),
+    annual_hours > 0
+  )
+
+n_after  <- nrow(df_filtered)
+n_removed <- n_before - n_after
+cat(sprintf("\nFiltering: removed %d observations (%.2f%% of sample)\n",
+    n_removed, n_removed / n_before * 100))
+cat(sprintf("Analytical sample: %d observations\n", n_after))
+```
+
+```{r}
+# =============================================================================
+# SECTION 6: FACTOR ENCODING
+# =============================================================================
+# Ordered factors: education and age_group — their ordinal structure is
+# meaningful and should be communicated to tree-based models (RF, DML).
+# OLS with ordered factors uses polynomial contrasts by default in R;
+# consider using unordered + reference level for cleaner OLS output.
+
+df_factors <- df_filtered %>%
+  mutate(
+
+    # ── Treatment variable ────────────────────────────────────────────────
+    # Male as reference: standard in the wage gap literature
+    gender = factor(gender, levels = c("Male", "Female")),
+
+    # ── ORDERED factors (meaningful cardinal ranking) ─────────────────────
+    education = factor(education,
+      ordered = TRUE,
+      levels  = c("Less than Primary", "Primary Education", "Lower Secondary",
+                  "Upper Secondary", "Vocational Training",
+                  "University Diploma", "Bachelors/Masters/PhD")),
+
+    age_group = factor(age_group,
+      ordered = TRUE,
+      levels  = c("<19 years", "20-29", "30-39", "40-49", "50-59", ">59 years")),
+
+    firm_size = factor(firm_size,
+      ordered = TRUE,
+      levels  = c("Small (1-49)", "Medium (50-199)", "Large (>200)")),
+
+    market_scope = factor(market_scope,
+      ordered = TRUE,
+      levels  = c("Local/Regional", "National", "European Union", "Global")),
+
+    # ── UNORDERED factors (nominal categories) ────────────────────────────
+    working_day          = factor(working_day),
+    contract_type        = factor(contract_type),
+    sector               = factor(sector),
+    occupation           = factor(occupation),
+    region               = factor(region),
+    firm_sector          = factor(firm_sector),
+    supervisory_role     = factor(supervisory_role),
+    collective_bargaining= factor(collective_bargaining,
+                                  levels = c("Centralised", "Decentralised")),
+    nationality          = factor(nationality, levels = c("Spanish", "Foreign"))
+  )
+
+cat("\nFactor encoding complete.\n")
+cat("Summary of treatment variable:\n")
+print(table(df_factors$gender, useNA = "always"))
+```
+
+```{r}
+# =============================================================================
+# SECTION 7: LISTWISE DELETION — DROP NAs IN MODEL VARIABLES
+# =============================================================================
+# We apply listwise deletion only for the variables used in at least one
+# model specification. Variables used only in robustness checks (nationality)
+# are excluded from the main deletion step to preserve sample size.
+
+core_vars <- c("log_hourly_wage", "gender", "education", "tenure",
+               "age_group", "occupation", "sector", "contract_type",
+               "working_day", "region", "firm_size", "firm_sector",
+               "supervisory_role", "market_scope", "collective_bargaining")
+
+df_main <- df_factors %>%
+  drop_na(all_of(core_vars))
+
+cat(sprintf("\nMain analytical dataset (Spec 1 & 2): n = %d\n", nrow(df_main)))
+cat(sprintf("  Dropped for missing core vars: %d (%.2f%%)\n",
+    nrow(df_filtered) - nrow(df_main),
+    (nrow(df_filtered) - nrow(df_main)) / nrow(df_filtered) * 100))
+
+# Full dataset for Spec 3 (DML) — also requires nationality
+df_dml <- df_main %>%
+  drop_na(nationality)
+
+cat(sprintf("DML dataset (Spec 3, incl. nationality): n = %d\n", nrow(df_dml)))
+print(core_vars)
+head(df_main[,56:77])
+df_main %>% 
+  select(gender:last_col()) %>% 
+  head()
+glimpse(df_main[, 57:77])
+df_main[,57:77] %>% head() %>% print(width = Inf) #Fig 3.6 
+head(df_dml)
+```
+
+```{r}
+# =============================================================================
+# SECTION 8: THE THREE MODEL SPECIFICATIONS
+# =============================================================================
+#
+# The three specifications are nested — each is a strict superset of the
+# previous. This nesting is intentional: the progression of the gender
+# coefficient from Spec 1 to Spec 3 is itself a result, showing how
+# institutional variables (MERCADO, REGULACION) affect the estimate.
+#
+# References for specification choices:
+#   Mincer (1974)          — core human capital equation
+#   Goldin (2014)          — hours/flexibility mechanism
+#   Blau & Kahn (2017)     — comprehensive controls benchmark
+#   Chernozhukov et al.    — DML high-dimensional controls
+#   Card, Cardoso &        — collective bargaining
+#     Kline (2016)
+#   Simón et al. (2008)    — Spanish institutional controls
+
+# ── Spec 1: OLS Baseline ─────────────────────────────────────────────────────
+# The canonical Mincer wage equation augmented with job and firm characteristics.
+# Every variable here has a direct counterpart in the wage gap literature.
+# This is also the specification used for the THREE models in Oaxaca-Blinder:
+# (a) pooled, (b) male-only, (c) female-only.
+spec1_controls <- c(
+  # Human capital (Mincer 1974, Goldin 2014)
+  "education",        # ESTU:    returns to schooling
+  "tenure",           # ANOANTI: firm-specific experience
+  "tenure_sq",        # ANOANTI²: concave experience-wage profile
+  "age_group",        # ANOS2:   general labour market experience proxy
+
+  # Job characteristics (Blau & Kahn 2017)
+  "occupation",       # CNO1:    within-firm hierarchy position
+  "sector",           # CNACE:   industry wage premium
+  "contract_type",    # TIPOCON: permanent vs. temporary contract penalty
+  "working_day",      # TIPOJOR: full vs. part-time (beyond hourly adjustment)
+  "supervisory_role", # RESPONSA: managerial responsibility premium
+
+  # Firm characteristics
+  "region",           # NUTS1:   local labour market conditions
+  "firm_size",        # ESTRATO2: size-wage premium (Oi & Idson 1999)
+  "firm_sector"       # CONTROL: public sector pay compression
+)
+
+spec1_formula <- as.formula(
+  paste("log_hourly_wage ~ gender +", paste(spec1_controls, collapse = " + "))
+)
+cat("\nSpec 1 formula:\n"); print(spec1_formula)
+
+# ── Spec 2: OLS Extended + Oaxaca-Blinder ────────────────────────────────────
+# Adds two institutional variables available in the EES but absent from most
+# other wage datasets. Their inclusion allows us to test whether the gender
+# coefficient is driven by institutional sorting (women in local-market, 
+# centrally-bargained firms) rather than within-firm discrimination.
+# If the gender coefficient barely changes from Spec 1 → Spec 2, that is
+# evidence that institutional sorting is NOT confounding the OLS estimate.
+spec2_controls <- c(
+  spec1_controls,
+
+  # Firm market exposure (Blau & Kahn 2017, Zweimüller et al. 2008)
+  "market_scope",       # MERCADO: local → global (exporter wage premium)
+
+  # Collective bargaining level (Card, Cardoso & Kline 2016)
+  "collective_bargaining" # REGULACION: centralised vs. decentralised CB
+)
+
+spec2_formula <- as.formula(
+  paste("log_hourly_wage ~ gender +", paste(spec2_controls, collapse = " + "))
+)
+cat("\nSpec 2 formula:\n"); print(spec2_formula)
+
+# ── Spec 3: DML (high-dimensional, maximum confounding absorption) ────────────
+# Adds nationality control for the DML nuisance models only.
+# In DML, the nuisance functions E[Y|X] and E[D|X] are fitted with Random
+# Forest — so additional variables cost nothing in interpretability and
+# help absorb immigrant-female overlap confounding.
+# NATIONALITY IS NOT INTERPRETED AS A CAUSAL VARIABLE — it is purely a
+# confounding absorber in the ML nuisance step.
+spec3_controls <- c(
+  spec2_controls,
+  "nationality"  # TIPOPAIS: absorbs immigrant-female overlap in DML nuisance
+)
+
+# Note: spec3_formula is defined but not used for OLS — only for DML
+spec3_confounders <- spec3_controls  # used in DoubleMLData$new() x_cols
+
+cat("\nSpec 3 DML confounders (", length(spec3_confounders), "variables):\n")
+cat(paste(" -", spec3_confounders, collapse = "\n"), "\n")
+```
+
+```{r}
+# =============================================================================
+# SECTION 9: EXPLICITLY EXCLUDED VARIABLES & REASONS
+# =============================================================================
+# This section is documentation only — nothing is coded here.
+# The rationale for each exclusion is stated for the thesis methodology
+# chapter and for tribunal questions.
+
+excluded_variables <- tribble(
+  ~Variable,   ~Description,                          ~Reason_for_Exclusion,
+  "IRPFMES",   "Monthly income tax withholding",       "Endogenous: IRPF is a function of salary (outcome), not a predictor. Including it creates reverse causality bias by construction.",
+  "COTIZA",    "Social security contributions",         "Endogenous: SS contributions are set as a % of salary. Same problem as IRPFMES.",
+  "BASE",      "Social security contribution base",     "Endogenous: computed from salary. Inclusion = regressing Y on a transformation of Y.",
+  "SALBASE",   "Base salary (October)",                 "Component of RETRINOIN: including salary components as predictors of total salary creates perfect multicollinearity by construction.",
+  "EXTRAORM",  "Monthly extraordinary payment",         "Component of RETRINOIN: same issue as SALBASE.",
+  "COMSAL",    "Salary supplements (October)",          "Component of RETRINOIN: same issue as SALBASE.",
+  "COMSALTT",  "Shift-work supplements",               "Component of RETRINOIN: same issue.",
+  "GEXTRA",    "Annual extraordinary bonuses",          "Component of RETRINOIN: same issue.",
+  "PHEXTRA",   "Overtime payments",                    "Component of RETRINOIN: same issue.",
+  "RETRIIN",   "IT-related annual salary",              "Selection: incapacity spells introduce a non-random selection mechanism. Including IT salary mixes two different labour market states.",
+  "FIJODISM",  "Months worked (discontinuous workers)", "Selection: applies only to fijo-discontinuo workers. Including it for the full sample introduces sample selection bias.",
+  "FIJODISD",  "Days worked (discontinuous workers)",   "Same as FIJODISM.",
+  "FACTOTAL",  "Sampling expansion factor",             "Design weight: this is a survey weight, not a covariate. Regression uses analytical weights if needed, not as a variable.",
+  "ORDENTRA",  "Worker order number",                   "Administrative identifier: no economic content.",
+  "DRELABD",   "Labour relationship duration (days)",   "Collinear with tenure and contract_type. The additional variation is tiny and interpretation is unclear in a stock survey.",
+  "VESPIN",    "In-kind earnings (IT-related)",         "Same selection issue as RETRIIN.",
+  "VESPNOIN",  "In-kind earnings (non-IT)",             "Minor component, not standard in wage gap literature. Adding complexity without proportional identification gain.",
+  "JSP1/JSP2", "Weekly pacted hours",                   "Redundant with JAP (annual pacted hours). We use JAP directly in the dependent variable construction.",
+  "HEXTRA",    "Overtime hours",                        "Partly endogenous to sector/occupation. Used descriptively in EDA but not in regression models."
+)
+
+cat("\n=== EXCLUDED VARIABLES (", nrow(excluded_variables), "variables) ===\n")
+print(excluded_variables %>% select(Variable, Reason_for_Exclusion))
+```
+
+```{r}
+# =============================================================================
+# SECTION 10: FINAL DATASETS & QUICK DIAGNOSTICS
+# =============================================================================
+
+cat("\n=== FINAL DATASETS ===\n")
+cat(sprintf("df_main  (Spec 1 & 2, OLS + OB): n = %d | vars = %d\n",
+    nrow(df_main), ncol(df_main)))
+cat(sprintf("df_dml   (Spec 3, DML):           n = %d | vars = %d\n",
+    nrow(df_dml), ncol(df_dml)))
+
+# Raw gender wage gap (before any controls)
+gap_summary <- df_main %>%
+  group_by(gender) %>%
+  summarise(
+    n              = n(),
+    mean_log_wage  = round(mean(log_hourly_wage, na.rm = TRUE), 4),
+    median_hourly  = round(median(hourly_wage,   na.rm = TRUE), 2),
+    pct_fulltime   = round(mean(working_day == "Full-time", na.rm = TRUE) * 100, 1),
+    pct_university = round(mean(education >= "University Diploma", na.rm = TRUE) * 100, 1),
+    mean_tenure    = round(mean(tenure, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+cat("\nDescriptive statistics by gender:\n")
+print(gap_summary)
+
+# Raw log-wage gap
+raw_gap <- gap_summary$mean_log_wage[gap_summary$gender == "Female"] -
+           gap_summary$mean_log_wage[gap_summary$gender == "Male"]
+cat(sprintf("\nRaw unadjusted log-wage gap (F - M): %.4f\n", raw_gap))
+cat(sprintf("Implied %% gap:                       %.2f%%\n",
+    (exp(raw_gap) - 1) * 100))
+
+# Gender composition of key variables (spot-check for plausibility)
+cat("\nGender split by occupation group (top 5 most common):\n")
+df_main %>%
+  count(occupation, gender) %>%
+  pivot_wider(names_from = gender, values_from = n, values_fill = 0) %>%
+  mutate(total = Male + Female,
+         pct_female = round(Female / total * 100, 1)) %>%
+  arrange(desc(total)) %>%
+  slice_head(n = 5) %>%
+  print()
+
+cat("\nGender split by collective bargaining level:\n")
+df_main %>%
+  count(collective_bargaining, gender) %>%
+  pivot_wider(names_from = gender, values_from = n, values_fill = 0) %>%
+  mutate(pct_female = round(Female / (Male + Female) * 100, 1)) %>%
+  print()
+
+cat("\nMarket scope distribution:\n")
+print(table(df_main$market_scope, useNA = "always"))
+
+cat("\n=== PREPROCESSING COMPLETE ===\n")
+cat("Objects ready for analysis:\n")
+cat("  df_main      — use for OLS (Spec 1, Spec 2) and Oaxaca-Blinder\n")
+cat("  df_dml       — use for DML (Spec 3)\n")
+cat("  spec1_formula — OLS Spec 1 formula object\n")
+cat("  spec2_formula — OLS Spec 2 / Oaxaca-Blinder formula object\n")
+cat("  spec3_confounders — character vector of DML X confounders\n")
+cat("\nNext: source('01_EDA.R')\n")
+```

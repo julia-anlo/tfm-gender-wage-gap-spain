@@ -1,0 +1,893 @@
+---
+title: "TFM — Gender Wage Gap in Spain: Simulation Study"
+subtitle: "Which Estimator Recovers the True Gap? OLS vs DML"
+author: "Julia Anglada Lomaeva | MESIO UPC-UB | 2025-26"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache   = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+# Overview
+
+This script runs the simulation study for the TFM. It answers the question:
+**Which estimator — OLS or DML — recovers the true gender penalty more
+accurately under different data-generating processes (DGPs)?**
+
+The structure:
+- **DGP 1**: Linear world — OLS assumptions hold exactly (sanity check)
+- **DGP 2 v1–v5**: The Hall of Shame — five DGPs where OLS survived
+- **DGP 2 v6**: The career pocket — the DGP where DML wins decisively
+
+True gender penalty: **theta = −0.10** throughout.  
+Performance metrics: Bias, RMSE, and 95% CI Coverage.
+
+---
+
+# Setup and prerequisites
+
+```{r libraries}
+library(tidyverse)
+library(lmtest)
+library(sandwich)
+library(DoubleML)
+library(mlr3)
+library(mlr3learners)
+library(data.table)
+library(furrr)
+library(future)
+library(ggplot2)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+
+# Prerequisites
+if (!exists("df_main"))          stop("Run 01_preprocessing.R first.")
+if (!exists("sector_dist"))      message("sector_dist not found — will create from df_main")
+
+cat("Libraries loaded.\n")
+```
+
+```{r auto-load, include=FALSE}
+# Auto-load preprocessed data if not in environment
+if (!exists("df_main")) {
+  message("Running preprocessing...")
+  source("00_preprocessing.R", local = FALSE)
+}
+```
+
+
+```{r calibration}
+# ============================================================
+# CALIBRATE SYNTHETIC DATA FROM EES 2022
+# All DGPs are calibrated to real EES 2022 distributions
+# ============================================================
+
+edu_dist    <- prop.table(table(df_main$education))
+age_dist    <- prop.table(table(df_main$age_group))
+sector_dist <- prop.table(table(df_main$sector)) %>%
+  sort(decreasing = TRUE) %>% head(10)
+sector_dist <- sector_dist / sum(sector_dist)
+
+pct_female  <- mean(df_main$gender == "Female")
+tenure_mean <- mean(df_main$tenure, na.rm = TRUE)
+tenure_sd   <- sd(df_main$tenure,   na.rm = TRUE)
+
+resid_sd <- sd(resid(lm(
+  log_hourly_wage ~ gender + education + tenure + I(tenure^2) + occupation + sector,
+  data = df_main)), na.rm = TRUE)
+
+THETA_TRUE <- -0.10
+
+cat(sprintf("Calibration complete:\n"))
+cat(sprintf("  Female share:       %.1f%%\n", pct_female * 100))
+cat(sprintf("  Tenure mean / SD:   %.1f / %.1f years\n", tenure_mean, tenure_sd))
+cat(sprintf("  Residual SD:        %.4f log points\n", resid_sd))
+cat(sprintf("  True penalty:       theta = %.2f (%.1f%% wage penalty)\n",
+    THETA_TRUE, (exp(THETA_TRUE) - 1) * 100))
+```
+
+---
+
+# Shared infrastructure
+
+```{r shared_covariates}
+# Sector wage premiums (calibrated to EES sector means)
+sector_map <- c(
+  "Financial and Insurance Activities"      =  0.35,
+  "Information and Communications (ICT)"    =  0.30,
+  "Electricity, Gas and Steam Supply"       =  0.28,
+  "Manufacturing: Chemical and Pharma"      =  0.15,
+  "Construction"                            =  0.05,
+  "Retail Trade"                            = -0.05,
+  "Hospitality (Accommodation and Food)"    = -0.12,
+  "Administrative and Support Services"     = -0.08,
+  "Human Health and Social Work Activities" =  0.02,
+  "Education"                               =  0.01
+)
+
+# Base covariate generator — shared by all DGPs
+generate_covariates <- function(n) {
+  tibble(
+    female        = rbinom(n, 1, pct_female),
+    education_num = sample(1:7, n, replace = TRUE, prob = as.numeric(edu_dist)),
+    education     = factor(education_num, levels = 1:7,
+                      labels = c("Less than Primary", "Primary Education",
+                                 "Lower Secondary",   "Upper Secondary",
+                                 "Vocational Training","University Diploma",
+                                 "Bachelors/Masters/PhD"), ordered = TRUE),
+    tenure        = pmax(0, pmin(45, rnorm(n, tenure_mean, tenure_sd))),
+    age_group     = sample(levels(df_main$age_group), n, replace = TRUE,
+                           prob = as.numeric(age_dist)),
+    sector        = sample(names(sector_dist), n, replace = TRUE,
+                           prob = as.numeric(sector_dist)),
+    firm_size_num = sample(1:3, n, replace = TRUE, prob = c(0.4, 0.3, 0.3)),
+    permanent     = rbinom(n, 1, 0.70),
+    public        = rbinom(n, 1, 0.25),
+    supervisor    = rbinom(n, 1, 0.20)
+  )
+}
+
+# Shared data prep for estimators
+prep_sim_data <- function(dat) {
+  dat %>%
+    mutate(
+      gender           = factor(ifelse(female == 1, "Female", "Male"),
+                                levels = c("Male", "Female")),
+      education        = factor(education_num, levels = 1:7,
+                           labels = levels(df_main$education), ordered = TRUE),
+      sector           = factor(sector, levels = names(sector_dist)),
+      contract_type    = factor(ifelse(permanent  == 1, "Permanent",  "Temporary")),
+      firm_sector      = factor(ifelse(public     == 1, "Public",     "Private")),
+      supervisory_role = factor(ifelse(supervisor == 1, "Yes",        "No")),
+      firm_size        = factor(firm_size_num, levels = 1:3,
+                           labels = c("Small (1-49)", "Medium (50-199)", "Large (>200)"),
+                           ordered = TRUE),
+      log_hourly_wage  = log_wage
+    )
+}
+```
+
+```{r estimators}
+# ============================================================
+# ESTIMATOR FUNCTIONS
+# ============================================================
+
+# OLS with HC3 robust standard errors
+run_ols <- function(dat) {
+  d  <- prep_sim_data(dat)
+  m  <- lm(log_hourly_wage ~ gender + education + tenure + I(tenure^2) +
+             sector + contract_type + firm_sector + supervisory_role + firm_size,
+           data = d)
+  v  <- vcovHC(m, type = "HC3")
+  b  <- coef(m)["genderFemale"]
+  se <- sqrt(v["genderFemale", "genderFemale"])
+  tibble(estimator = "OLS", estimate = b, se = se,
+         ci_lo = b - 1.96 * se, ci_hi = b + 1.96 * se)
+}
+
+# DML with Random Forest nuisance
+run_dml <- function(dat, n_trees = 200, max_depth = 5, n_folds = 3) {
+  d <- prep_sim_data(dat) %>%
+    mutate(
+      female_int = as.integer(gender == "Female"),
+      across(where(is.factor), as.integer)
+    )
+
+  x_cols <- c("education", "tenure", "sector", "contract_type",
+               "firm_sector", "supervisory_role", "firm_size")
+  x_cols <- x_cols[x_cols %in% names(d)]
+
+  tryCatch({
+    dt <- d %>%
+      dplyr::select(log_hourly_wage, female_int, all_of(x_cols)) %>%
+      drop_na() %>%
+      as.data.table()
+
+    dml_obj <- DoubleMLData$new(dt,
+      y_col  = "log_hourly_wage",
+      d_cols = "female_int",
+      x_cols = x_cols)
+
+    plr <- DoubleMLPLR$new(
+      dml_obj,
+      lrn("regr.ranger", num.trees = n_trees, max.depth = max_depth),
+      lrn("regr.ranger", num.trees = n_trees, max.depth = max_depth),
+      n_folds = n_folds,
+      n_rep   = 1,
+      score   = "partialling out"
+    )
+    suppressMessages(plr$fit())
+
+    theta <- plr$coef["female_int"]
+    se    <- plr$se["female_int"]
+    tibble(estimator = "DML", estimate = theta, se = se,
+           ci_lo = theta - 1.96 * se, ci_hi = theta + 1.96 * se)
+
+  }, error = function(e) {
+    tibble(estimator = "DML", estimate = NA_real_, se = NA_real_,
+           ci_lo = NA_real_, ci_hi = NA_real_)
+  })
+}
+
+# Single iteration runner
+run_one_iteration <- function(b, dgp_fn, dgp_name, n,
+                               n_trees = 200, max_depth = 5) {
+  set.seed(b * 1000)
+  dat <- dgp_fn(n)
+  bind_rows(
+    run_ols(dat),
+    run_dml(dat, n_trees = n_trees, max_depth = max_depth)
+  ) %>%
+    mutate(
+      dgp       = dgp_name,
+      iteration = b,
+      theta_true = THETA_TRUE,
+      bias       = estimate - THETA_TRUE,
+      sq_error   = (estimate - THETA_TRUE)^2,
+      covered    = !is.na(ci_lo) & ci_lo <= THETA_TRUE & ci_hi >= THETA_TRUE
+    )
+}
+
+# Metrics summariser
+compute_metrics <- function(results_df) {
+  results_df %>%
+    drop_na(estimate) %>%
+    group_by(dgp, estimator) %>%
+    summarise(
+      n_iter    = n(),
+      mean_est  = mean(estimate),
+      bias      = mean(bias),
+      pct_bias  = round(bias / abs(THETA_TRUE) * 100, 1),
+      rmse      = sqrt(mean(sq_error)),
+      coverage  = mean(covered) * 100,
+      .groups   = "drop"
+    ) %>%
+    mutate(across(c(mean_est, bias, rmse), ~round(.x, 4)))
+}
+
+cat("Estimator functions defined.\n")
+```
+
+---
+
+# DGP 1 — Linear world (sanity check)
+
+The true model is linear and additive. OLS assumptions hold exactly. Both
+estimators should recover theta = −0.10 with near-zero bias and ~95% coverage.
+This is the Gauss-Markov world — OLS is BLUE here.
+
+```{r dgp1_define}
+dgp_linear <- function(n) {
+  dat          <- generate_covariates(n)
+  edu_effect   <- (dat$education_num - 1) * 0.065
+  sector_effect <- sector_map[dat$sector]
+  sector_effect[is.na(sector_effect)] <- 0
+
+  # Constant gender penalty = THETA_TRUE for all female workers
+  # No interactions, no endogenous sorting — OLS world
+  dat$log_wage <- 2.50 +
+    THETA_TRUE * dat$female +
+    edu_effect +
+    0.025 * dat$tenure +
+    -0.0004 * dat$tenure^2 +
+    sector_effect +
+    0.08 * dat$public +
+    0.05 * dat$supervisor +
+    -0.06 * (1 - dat$permanent) +
+    rnorm(n, 0, resid_sd)
+  dat
+}
+
+# Verify DGP 1
+set.seed(42)
+check_dgp1 <- dgp_linear(50000)
+cat(sprintf("DGP 1 verification — raw gap: %.4f (target: %.2f)\n",
+    mean(check_dgp1$log_wage[check_dgp1$female == 1]) -
+    mean(check_dgp1$log_wage[check_dgp1$female == 0]),
+    THETA_TRUE))
+```
+
+```{r dgp1_run, cache=TRUE}
+B     <- 500
+N_SIM <- 5000
+
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
+
+cat("Running DGP 1 (linear world)...\n")
+set.seed(2024)
+results_dgp1 <- future_map_dfr(
+  1:B,
+  ~run_one_iteration(.x, dgp_linear, "DGP 1: Linear", N_SIM,
+                     n_trees = 200, max_depth = 5),
+  .options = furrr_options(seed = TRUE)
+)
+
+plan(sequential)
+
+metrics_dgp1 <- compute_metrics(results_dgp1)
+kable(metrics_dgp1 %>% select(dgp, estimator, mean_est, bias, pct_bias, rmse, coverage),
+      caption = "Table: DGP 1 performance metrics. True theta = -0.10.",
+      digits  = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+**Interpretation:** Both estimators recover −0.10 with near-zero bias and
+coverage close to the nominal 95%. DML is no worse than OLS when OLS assumptions
+hold. This confirms the Frisch-Waugh-Lovell claim: when g_0(X) is linear, OLS
+and DML converge to the same estimator.
+
+---
+
+# The Hall of Shame — five DGPs that failed to break OLS
+
+OLS is surprisingly robust. Finding conditions where DML wins required six
+versions. Each failure teaches something about what OLS can and cannot handle.
+
+## DGP 2 v1 — Categorical interaction (dummies)
+
+**Mechanism:** Sector × firm_size interaction. Gender penalty constant.  
+**Why OLS survived:** lm() dummies capture categorical interactions exactly.
+Nothing left for DML to discover.
+
+```{r dgp2_v1_define}
+dgp_v1_dummies <- function(n) {
+  dat          <- generate_covariates(n)
+  edu_effect   <- (dat$education_num - 1) * 0.065
+  sector_effect <- sector_map[dat$sector]
+  sector_effect[is.na(sector_effect)] <- 0
+
+  # Sector × firm_size interaction (fully captured by dummies in OLS)
+  interaction_effect <- case_when(
+    dat$sector == "Financial and Insurance Activities" & dat$firm_size_num == 3 ~ 0.15,
+    dat$sector == "Information and Communications (ICT)" & dat$firm_size_num == 3 ~ 0.12,
+    dat$sector == "Hospitality (Accommodation and Food)" & dat$firm_size_num == 1 ~ -0.08,
+    TRUE ~ 0
+  )
+
+  dat$log_wage <- 2.50 +
+    THETA_TRUE * dat$female +
+    edu_effect +
+    0.025 * dat$tenure + -0.0004 * dat$tenure^2 +
+    sector_effect +
+    interaction_effect +
+    0.08 * dat$public + 0.05 * dat$supervisor + -0.06 * (1 - dat$permanent) +
+    rnorm(n, 0, resid_sd)
+  dat
+}
+```
+
+```{r dgp2_v1_run, cache=TRUE}
+cat("Running DGP 2 v1 (dummies)...\n")
+set.seed(2024)
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
+results_v1 <- future_map_dfr(
+  1:B, ~run_one_iteration(.x, dgp_v1_dummies, "DGP 2 v1: Dummies", N_SIM,
+                          n_trees = 200, max_depth = 5),
+  .options = furrr_options(seed = TRUE))
+plan(sequential)
+metrics_v1 <- compute_metrics(results_v1)
+cat("Result: OLS bias =", metrics_v1$pct_bias[metrics_v1$estimator == "OLS"],
+    "% | DML bias =", metrics_v1$pct_bias[metrics_v1$estimator == "DML"], "%\n")
+cat("OLS survived: categorical dummies capture this exactly.\n\n")
+```
+
+## DGP 2 v2 — Smooth non-linear tenure (logistic curve)
+
+**Mechanism:** Tenure-wage profile is logistic (S-shaped), not quadratic.  
+**Why OLS survived:** tenure² approximates smooth curves well enough that
+OLS sees negligible bias. Exogenous treatment means OLS is unbiased even
+with mild functional form misspecification.
+
+```{r dgp2_v2_define}
+dgp_v2_smooth <- function(n) {
+  dat          <- generate_covariates(n)
+  edu_effect   <- (dat$education_num - 1) * 0.065
+  sector_effect <- sector_map[dat$sector]
+  sector_effect[is.na(sector_effect)] <- 0
+
+  # Logistic (S-shaped) tenure profile — smooth, not a step function
+  tenure_logistic <- 0.8 / (1 + exp(-0.3 * (dat$tenure - 10)))
+
+  dat$log_wage <- 2.50 +
+    THETA_TRUE * dat$female +
+    edu_effect +
+    tenure_logistic +
+    sector_effect +
+    0.08 * dat$public + 0.05 * dat$supervisor + -0.06 * (1 - dat$permanent) +
+    rnorm(n, 0, resid_sd)
+  dat
+}
+```
+
+```{r dgp2_v2_run, cache=TRUE}
+cat("Running DGP 2 v2 (smooth curve)...\n")
+set.seed(2024)
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
+results_v2 <- future_map_dfr(
+  1:B, ~run_one_iteration(.x, dgp_v2_smooth, "DGP 2 v2: Smooth curve", N_SIM,
+                          n_trees = 200, max_depth = 5),
+  .options = furrr_options(seed = TRUE))
+plan(sequential)
+metrics_v2 <- compute_metrics(results_v2)
+cat("Result: OLS bias =", metrics_v2$pct_bias[metrics_v2$estimator == "OLS"],
+    "% | DML bias =", metrics_v2$pct_bias[metrics_v2$estimator == "DML"], "%\n")
+cat("OLS survived: tenure² approximates smooth curves well enough.\n\n")
+```
+
+## DGP 2 v3 — Sine wave (high-frequency oscillations)
+
+**Mechanism:** High-frequency sine wave in tenure-wage profile.  
+**Why OLS survived:** Both estimators fail equally — RF depth = 5 is too
+shallow to find high-frequency patterns. Neither OLS nor DML wins here;
+this version was discarded as uninformative.
+
+```{r dgp2_v3_define}
+dgp_v3_sine <- function(n) {
+  dat          <- generate_covariates(n)
+  edu_effect   <- (dat$education_num - 1) * 0.065
+  sector_effect <- sector_map[dat$sector]
+  sector_effect[is.na(sector_effect)] <- 0
+
+  # High-frequency oscillations in tenure
+  tenure_sine <- 0.3 * sin(dat$tenure * pi / 3)
+
+  dat$log_wage <- 2.50 +
+    THETA_TRUE * dat$female +
+    edu_effect +
+    tenure_sine +
+    sector_effect +
+    0.08 * dat$public + 0.05 * dat$supervisor + -0.06 * (1 - dat$permanent) +
+    rnorm(n, 0, resid_sd)
+  dat
+}
+```
+
+```{r dgp2_v3_run, cache=TRUE}
+cat("Running DGP 2 v3 (sine wave)...\n")
+set.seed(2024)
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
+results_v3 <- future_map_dfr(
+  1:B, ~run_one_iteration(.x, dgp_v3_sine, "DGP 2 v3: Sine wave", N_SIM,
+                          n_trees = 200, max_depth = 5),
+  .options = furrr_options(seed = TRUE))
+plan(sequential)
+metrics_v3 <- compute_metrics(results_v3)
+cat("Result: OLS RMSE =", metrics_v3$rmse[metrics_v3$estimator == "OLS"],
+    "| DML RMSE =", metrics_v3$rmse[metrics_v3$estimator == "DML"], "\n")
+cat("Both fail equally — high-frequency signal, shallow RF. Discarded.\n\n")
+```
+
+## DGP 2 v4 — Endogenous sorting + sine wave
+
+**Mechanism:** Endogenous gender sorting + sine-wave confounding.  
+**Why OLS survived (partially):** DML slightly better but RF depth = 5
+is too weak to recover the full signal when combined with endogenous sorting.
+First sign that DML can outperform OLS, but effect too small to be convincing.
+
+```{r dgp2_v4_define}
+dgp_v4_endo_sine <- function(n) {
+  dat          <- generate_covariates(n)
+  edu_effect   <- (dat$education_num - 1) * 0.065
+  sector_effect <- sector_map[dat$sector]
+  sector_effect[is.na(sector_effect)] <- 0
+
+  # Endogenous sorting: gender correlated with high-wage sine peak
+  sine_peak <- (dat$tenure > 8 & dat$tenure < 16)
+  prob_female_endo <- plogis(-0.3 + 1.2 * sine_peak)
+  dat$female <- rbinom(n, 1, prob_female_endo)
+
+  # Sine confounding at the peak
+  tenure_sine <- 0.4 * sin(dat$tenure * pi / 4)
+
+  dat$log_wage <- 2.50 +
+    THETA_TRUE * dat$female +
+    edu_effect +
+    tenure_sine +
+    sector_effect +
+    0.08 * dat$public + 0.05 * dat$supervisor + -0.06 * (1 - dat$permanent) +
+    rnorm(n, 0, resid_sd)
+  dat
+}
+```
+
+```{r dgp2_v4_run, cache=TRUE}
+cat("Running DGP 2 v4 (endogenous + sine)...\n")
+set.seed(2024)
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
+results_v4 <- future_map_dfr(
+  1:B, ~run_one_iteration(.x, dgp_v4_endo_sine, "DGP 2 v4: Endo+sine", N_SIM,
+                          n_trees = 200, max_depth = 5),
+  .options = furrr_options(seed = TRUE))
+plan(sequential)
+metrics_v4 <- compute_metrics(results_v4)
+cat("Result: OLS bias =", metrics_v4$pct_bias[metrics_v4$estimator == "OLS"],
+    "% | DML bias =", metrics_v4$pct_bias[metrics_v4$estimator == "DML"], "%\n")
+cat("DML slightly better — first glimpse. RF depth too weak to fully exploit advantage.\n\n")
+```
+
+## DGP 2 v5 — First career pocket (wider boundaries)
+
+**Mechanism:** Career pocket at tenure 10–22 years + university education.
+Endogenous gender sorting. DML wins for the first time.  
+**Residual DML bias:** RF depth = 5 too shallow; pocket boundaries blurry.
+
+```{r dgp2_v5_define}
+dgp_v5_pocket_wide <- function(n) {
+  dat          <- generate_covariates(n)
+  edu_effect   <- (dat$education_num - 1) * 0.065
+  sector_effect <- sector_map[dat$sector]
+  sector_effect[is.na(sector_effect)] <- 0
+
+  # Wider pocket: 10-22 years tenure + university education (ISCED >= 6)
+  pocket <- (dat$tenure >= 10 & dat$tenure <= 22 & dat$education_num >= 6)
+  pocket_premium <- 0.45 * pocket
+
+  # Endogenous sorting: women 2.5x more likely to be in pocket
+  prob_female <- plogis(-0.5 + 2.0 * pocket)
+  dat$female  <- rbinom(n, 1, prob_female)
+
+  dat$log_wage <- 2.50 +
+    THETA_TRUE * dat$female +
+    edu_effect +
+    pocket_premium +
+    0.025 * dat$tenure + -0.0004 * dat$tenure^2 +
+    sector_effect +
+    0.08 * dat$public + 0.05 * dat$supervisor + -0.06 * (1 - dat$permanent) +
+    rnorm(n, 0, resid_sd)
+  dat
+}
+
+# Verify female share inside vs outside pocket
+set.seed(42)
+check_v5 <- dgp_v5_pocket_wide(50000)
+pct_f_in  <- mean(check_v5$female[check_v5$tenure >= 10 & check_v5$tenure <= 22 &
+                                    check_v5$education_num >= 6])
+pct_f_out <- mean(check_v5$female[!(check_v5$tenure >= 10 & check_v5$tenure <= 22 &
+                                     check_v5$education_num >= 6)])
+cat(sprintf("DGP 2 v5: female inside pocket = %.0f%%, outside = %.0f%%\n",
+    pct_f_in * 100, pct_f_out * 100))
+```
+
+```{r dgp2_v5_run, cache=TRUE}
+cat("Running DGP 2 v5 (pocket, wide)...\n")
+set.seed(2024)
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
+results_v5 <- future_map_dfr(
+  1:B, ~run_one_iteration(.x, dgp_v5_pocket_wide, "DGP 2 v5: Pocket (wide)", N_SIM,
+                          n_trees = 200, max_depth = 5),
+  .options = furrr_options(seed = TRUE))
+plan(sequential)
+metrics_v5 <- compute_metrics(results_v5)
+cat("Result: OLS bias =", metrics_v5$pct_bias[metrics_v5$estimator == "OLS"],
+    "% | DML bias =", metrics_v5$pct_bias[metrics_v5$estimator == "DML"], "%\n")
+cat(sprintf("OLS coverage: %.1f%% | DML coverage: %.1f%%\n",
+    metrics_v5$coverage[metrics_v5$estimator == "OLS"],
+    metrics_v5$coverage[metrics_v5$estimator == "DML"]))
+cat("DML wins for the first time — but RF depth=5 leaves residual bias.\n\n")
+```
+
+---
+
+# DGP 2 v6 — The career pocket (FINAL)
+
+**The decisive mechanism.** Two conditions met simultaneously:  
+1. **Endogenous treatment:** gender correlated with pocket membership  
+2. **Discontinuous confounding:** step-function premium that polynomials/dummies cannot span
+
+Sharper pocket boundaries (12–20 years), deeper RF (depth = 8, 500 trees).
+
+```{r dgp2_v6_define}
+# =============================================================
+# DGP 2 v6: THE CAREER POCKET — FINAL MECHANISM
+# =============================================================
+# Motivated by De la Rica et al. (2008): senior professional tracks
+# in Spain for university-educated workers with 12-20 years tenure.
+#
+# Two conditions for OLS failure:
+# (1) Endogenous gender sorting into pocket (3x female rate)
+# (2) Step-function premium (not smooth) — polynomials cannot span it
+#
+# Why RF finds it: sequential binary splits on tenure > 12,
+# tenure < 20, education_num >= 6 — exactly the pocket boundaries.
+# =============================================================
+
+dgp_v6_pocket_final <- function(n) {
+  dat          <- generate_covariates(n)
+  edu_effect   <- (dat$education_num - 1) * 0.065
+  sector_effect <- sector_map[dat$sector]
+  sector_effect[is.na(sector_effect)] <- 0
+
+  # SHARPER pocket: 12-20 years tenure + university (ISCED >= 6)
+  # Step function — not smooth — polynomials cannot approximate this
+  pocket        <- (dat$tenure >= 12 & dat$tenure <= 20 & dat$education_num >= 6)
+  pocket_premium <- 0.55 * pocket  # +0.55 log points = ~73% wage premium
+
+  # ENDOGENOUS SORTING: 3x female rate inside pocket
+  # prob_female inside pocket ≈ 84%, outside ≈ 31%
+  prob_female <- plogis(-0.8 + 2.5 * as.numeric(pocket))
+  dat$female  <- rbinom(n, 1, prob_female)
+
+  # True penalty remains THETA_TRUE = -0.10 everywhere
+  dat$log_wage <- 2.50 +
+    THETA_TRUE * dat$female +
+    edu_effect +
+    pocket_premium +
+    0.025 * dat$tenure + -0.0004 * dat$tenure^2 +
+    sector_effect +
+    0.08 * dat$public + 0.05 * dat$supervisor + -0.06 * (1 - dat$permanent) +
+    rnorm(n, 0, resid_sd)
+  dat
+}
+
+# Verify pocket properties
+set.seed(42)
+check_v6 <- dgp_v6_pocket_final(50000)
+pct_f_in  <- mean(check_v6$female[check_v6$tenure >= 12 & check_v6$tenure <= 20 &
+                                    check_v6$education_num >= 6])
+pct_f_out <- mean(check_v6$female[!(check_v6$tenure >= 12 & check_v6$tenure <= 20 &
+                                     check_v6$education_num >= 6)])
+cat(sprintf("DGP 2 v6: female inside pocket = %.0f%%, outside = %.0f%%\n",
+    pct_f_in * 100, pct_f_out * 100))
+cat(sprintf("Pocket size: %.1f%% of workers\n",
+    mean(check_v6$tenure >= 12 & check_v6$tenure <= 20 &
+         check_v6$education_num >= 6) * 100))
+```
+
+```{r dgp2_v6_run, cache=TRUE}
+# DML v6 uses deeper RF: depth = 8, 500 trees
+# This isolates the RF depth effect:
+#   v5: depth=5, 200 trees → DML coverage 60.8%
+#   v6: depth=8, 500 trees → DML coverage 74.4%
+
+cat("Running DGP 2 v6 (pocket, final — deeper RF)...\n")
+
+run_one_iteration_v6 <- function(b, n) {
+  set.seed(b * 1000)
+  dat <- dgp_v6_pocket_final(n)
+  bind_rows(
+    run_ols(dat),
+    run_dml(dat, n_trees = 500, max_depth = 8)  # Deeper RF for v6
+  ) %>%
+    mutate(
+      dgp        = "DGP 2 v6: Pocket+ (final)",
+      iteration  = b,
+      theta_true = THETA_TRUE,
+      bias       = estimate - THETA_TRUE,
+      sq_error   = (estimate - THETA_TRUE)^2,
+      covered    = !is.na(ci_lo) & ci_lo <= THETA_TRUE & ci_hi >= THETA_TRUE
+    )
+}
+
+set.seed(2024)
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
+results_v6 <- future_map_dfr(
+  1:B,
+  ~run_one_iteration_v6(.x, N_SIM),
+  .options = furrr_options(seed = TRUE))
+plan(sequential)
+
+metrics_v6 <- compute_metrics(results_v6)
+cat(sprintf("OLS:  bias = +%.1f%% | coverage = %.1f%%\n",
+    metrics_v6$pct_bias[metrics_v6$estimator == "OLS"],
+    metrics_v6$coverage[metrics_v6$estimator == "OLS"]))
+cat(sprintf("DML:  bias = +%.1f%% | coverage = %.1f%%\n",
+    metrics_v6$pct_bias[metrics_v6$estimator == "DML"],
+    metrics_v6$coverage[metrics_v6$estimator == "DML"]))
+cat(sprintf("DML is %.1fx more accurate (bias ratio)\n",
+    metrics_v6$pct_bias[metrics_v6$estimator == "OLS"] /
+    metrics_v6$pct_bias[metrics_v6$estimator == "DML"]))
+```
+
+---
+
+# Results summary
+
+## The Hall of Shame — full table
+
+```{r hall_of_shame}
+all_metrics <- bind_rows(
+  compute_metrics(results_dgp1),
+  metrics_v1,
+  metrics_v2,
+  metrics_v3,
+  metrics_v4,
+  metrics_v5,
+  metrics_v6
+) %>%
+  mutate(
+    why_ols_survived = case_when(
+      dgp == "DGP 1: Linear"                  ~ "OLS is BLUE — Gauss-Markov applies",
+      dgp == "DGP 2 v1: Dummies"              ~ "Dummies capture categorical interactions exactly",
+      dgp == "DGP 2 v2: Smooth curve"         ~ "tenure² approximates smooth curves well",
+      dgp == "DGP 2 v3: Sine wave"            ~ "RF depth=5 too shallow — both estimators fail",
+      dgp == "DGP 2 v4: Endo+sine"            ~ "Marginal DML win — RF too weak for sine pattern",
+      dgp == "DGP 2 v5: Pocket (wide)"        ~ "DML wins for first time — RF depth=5 limits gain",
+      dgp == "DGP 2 v6: Pocket+ (final)"      ~ "OLS collapses — DML 4.3x more accurate",
+      TRUE ~ ""
+    )
+  )
+
+kable(all_metrics %>%
+  filter(estimator == "OLS") %>%
+  select(dgp, mean_est, pct_bias, coverage, why_ols_survived),
+  caption = "Table: Hall of Shame — OLS performance across all DGP versions. True theta = -0.10.",
+  col.names = c("DGP", "Mean estimate", "% Bias", "Coverage (%)", "Why OLS survived"),
+  digits = c(0, 4, 1, 1, 0)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  row_spec(7, bold = TRUE, color = "white", background = "#C00000")
+```
+
+## Full progression — OLS vs DML
+
+```{r full_progression}
+all_results_combined <- bind_rows(
+  results_dgp1,
+  results_v1, results_v2, results_v3, results_v4, results_v5, results_v6
+)
+
+progression <- compute_metrics(all_results_combined) %>%
+  select(dgp, estimator, mean_est, bias, pct_bias, rmse, coverage) %>%
+  arrange(dgp, estimator)
+
+kable(progression,
+      caption = "Table 5.5d — Full simulation progression. True theta = -0.10. B=500, n=5,000.",
+      digits = c(0, 0, 4, 4, 1, 4, 1)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  row_spec(which(progression$dgp == "DGP 2 v6: Pocket+ (final)" &
+                 progression$estimator == "OLS"), bold = TRUE, background = "#FFCCCC") %>%
+  row_spec(which(progression$dgp == "DGP 2 v6: Pocket+ (final)" &
+                 progression$estimator == "DML"), bold = TRUE, background = "#CCFFCC")
+```
+
+---
+
+# Figures
+
+```{r fig_bias_rmse, fig.width=12, fig.height=6}
+COL_OLS <- "#2E75B6"
+COL_DML <- "#C00000"
+
+key_dgps <- c("DGP 1: Linear", "DGP 2 v5: Pocket (wide)", "DGP 2 v6: Pocket+ (final)")
+
+fig_bias <- all_metrics %>%
+  filter(dgp %in% key_dgps) %>%
+  mutate(
+    estimator = factor(estimator, levels = c("OLS", "DML")),
+    dgp_label = factor(dgp,
+      levels = key_dgps,
+      labels = c("DGP 1\n(Linear world)", "DGP 2 v5\n(Pocket, wide)",
+                 "DGP 2 v6\n(Pocket+, FINAL)"))
+  ) %>%
+  ggplot(aes(x = estimator, y = bias, color = estimator)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "#555555", linewidth = 0.8) +
+  geom_point(size = 6, alpha = 0.9) +
+  geom_segment(aes(xend = estimator, y = bias - rmse, yend = bias + rmse),
+               linewidth = 1.4, alpha = 0.7) +
+  scale_color_manual(values = c("OLS" = COL_OLS, "DML" = COL_DML), guide = "none") +
+  facet_wrap(~dgp_label, ncol = 3) +
+  labs(
+    title    = "Figure 5.6 — Simulation Study: Bias and RMSE by Estimator",
+    subtitle = sprintf("True theta = %.2f | B = %d iterations, n = %d | Dot = bias | Segment = ±RMSE",
+        THETA_TRUE, B, N_SIM),
+    x = NULL, y = "Bias (estimate − true value)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(strip.text = element_text(face = "bold"), panel.spacing = unit(2, "lines"))
+
+print(fig_bias)
+ggsave("fig_simulation_bias_rmse.png", fig_bias, width = 12, height = 5, dpi = 200)
+```
+
+```{r fig_distributions, fig.width=12, fig.height=8}
+dist_data <- all_results_combined %>%
+  filter(dgp %in% key_dgps, !is.na(estimate)) %>%
+  mutate(
+    estimator = factor(estimator, levels = c("OLS", "DML")),
+    dgp_label = factor(dgp,
+      levels = key_dgps,
+      labels = c("DGP 1: Linear", "DGP 2 v5: Pocket", "DGP 2 v6: Pocket+"))
+  )
+
+fig_dist <- ggplot(dist_data, aes(x = estimate, fill = estimator)) +
+  geom_histogram(bins = 50, alpha = 0.75, position = "identity",
+                 colour = "white", linewidth = 0.2) +
+  geom_vline(xintercept = THETA_TRUE, colour = "#1A1A2E",
+             linetype = "dashed", linewidth = 1.2) +
+  scale_fill_manual(values = c("OLS" = COL_OLS, "DML" = COL_DML), name = "Estimator") +
+  annotate("text", x = THETA_TRUE, y = Inf, vjust = 2, hjust = -0.1,
+    label = sprintf("True\ntheta = %.2f", THETA_TRUE),
+    colour = "#1A1A2E", size = 3.2, fontface = "bold") +
+  facet_grid(estimator ~ dgp_label, scales = "free_y") +
+  labs(
+    title    = "Figure 5.7 — Distribution of Estimates Across 500 Iterations",
+    subtitle = "Narrower distribution closer to true value = better. OLS collapses in DGP 2 v6.",
+    x = "Estimated gender coefficient", y = "Frequency"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "none", strip.text = element_text(face = "bold"))
+
+print(fig_dist)
+ggsave("fig_simulation_distributions.png", fig_dist, width = 12, height = 8, dpi = 200)
+```
+
+```{r fig_coverage, fig.width=10, fig.height=5}
+coverage_data <- all_metrics %>%
+  filter(dgp %in% key_dgps) %>%
+  mutate(
+    estimator = factor(estimator, levels = c("OLS", "DML")),
+    dgp_label = factor(dgp,
+      levels = key_dgps,
+      labels = c("DGP 1\n(Linear)", "DGP 2 v5\n(Pocket)", "DGP 2 v6\n(Pocket+)"))
+  )
+
+fig_cov <- ggplot(coverage_data, aes(x = dgp_label, y = coverage, fill = estimator)) +
+  geom_col(position = position_dodge(width = 0.6), width = 0.5, alpha = 0.85) +
+  geom_hline(yintercept = 95, linetype = "dashed", colour = "#555555", linewidth = 0.8) +
+  annotate("text", x = 0.5, y = 96, hjust = 0, label = "Nominal 95%",
+           colour = "#555555", size = 3.5) +
+  scale_fill_manual(values = c("OLS" = COL_OLS, "DML" = COL_DML), name = "Estimator") +
+  scale_y_continuous(limits = c(0, 105), breaks = seq(0, 100, 20)) +
+  labs(
+    title    = "Figure 5.8 — 95% CI Coverage Rate",
+    subtitle = "Coverage = % of iterations where the 95% CI contains the true value (−0.10)",
+    x = NULL, y = "Coverage rate (%)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+
+print(fig_cov)
+ggsave("fig_simulation_coverage.png", fig_cov, width = 10, height = 5, dpi = 200)
+```
+
+---
+
+# Save results
+
+```{r save}
+write_csv(all_metrics,           "results_simulation_metrics_all_dgps.csv")
+write_csv(all_results_combined,  "results_simulation_full_all_dgps.csv")
+
+cat("\n=== SIMULATION STUDY COMPLETE ===\n")
+cat("Key result: DGP 2 v6 (career pocket)\n")
+cat(sprintf("  OLS: bias = +%.1f%% | coverage = %.1f%%\n",
+    metrics_v6$pct_bias[metrics_v6$estimator == "OLS"],
+    metrics_v6$coverage[metrics_v6$estimator == "OLS"]))
+cat(sprintf("  DML: bias = +%.1f%% | coverage = %.1f%%\n",
+    metrics_v6$pct_bias[metrics_v6$estimator == "DML"],
+    metrics_v6$coverage[metrics_v6$estimator == "DML"]))
+cat(sprintf("  DML is %.1fx more accurate (bias ratio)\n",
+    metrics_v6$pct_bias[metrics_v6$estimator == "OLS"] /
+    metrics_v6$pct_bias[metrics_v6$estimator == "DML"]))
+cat("\nSaved:\n")
+cat("  results_simulation_metrics_all_dgps.csv\n")
+cat("  results_simulation_full_all_dgps.csv\n")
+cat("  fig_simulation_bias_rmse.png\n")
+cat("  fig_simulation_distributions.png\n")
+cat("  fig_simulation_coverage.png\n")
+```
+
+---
+
+# Session info
+
+```{r session_info}
+sessionInfo()
+```

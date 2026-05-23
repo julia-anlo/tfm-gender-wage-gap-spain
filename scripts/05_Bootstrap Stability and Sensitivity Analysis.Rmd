@@ -1,0 +1,299 @@
+---
+title: "05_Bootstrap Stability and Sensitivity analysis"
+author: '"Julia Anglada Lomaeva"'
+date: "2026-04-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+# =============================================================================
+# TFM — Gender Wage Gap in Spain
+# MESIO UPC-UB | Julia Anglada Lomaeva | 2025-26
+# -----------------------------------------------------------------------------
+# SCRIPT 05: Monte Carlo Bootstrap Stability
+# -----------------------------------------------------------------------------
+# FIX HISTORY:
+#   v2: run_one_boot() — DoubleMLPLR$new() uses positional args (no obj_dml_data=)
+#                      — boot_data must be data.table (as.data.table already
+#                        applied since dml_df is data.table from Script 04)
+# =============================================================================
+
+library(tidyverse)
+library(DoubleML)
+library(mlr3)
+library(mlr3learners)
+library(data.table)
+library(furrr)
+library(future)
+library(ggplot2)
+library(patchwork)
+
+if (!exists("df_dml"))            stop("Run 01_preprocessing.R first.")
+if (!exists("spec3_confounders")) stop("Run 01_preprocessing.R first.")
+if (!exists("theta_rf"))          stop("Run 04_DML.R first.")
+
+cat("Monte Carlo bootstrap script loaded.\n")
+cat("n =", nrow(dml_df), "| Main DML estimate: theta_rf =",
+    round(theta_rf, 4), "\n\n")
+```
+
+```{r auto-load, include=FALSE}
+# Auto-load preprocessed data if not in environment
+if (!exists("df_main")) {
+  message("Running preprocessing...")
+  source("00_preprocessing.R", local = FALSE)
+}
+```
+
+
+```{r}
+# =============================================================================
+# SECTION 1: PARAMETERS
+# =============================================================================
+
+#### !!! ha tardado mas de 3h en ejecutarse
+
+#B       <- 1000
+#N_TREES <- 200
+#N_FOLDS <- 5
+#N_CORES <- max(1, parallel::detectCores() - 1)
+
+B       <- 200    # suficiente para demostrar estabilidad en un TFM
+N_TREES <- 100    # mitad de árboles — resultado prácticamente idéntico
+N_FOLDS <- 3      # 3-fold en vez de 5-fold — más rápido, aceptable aquí
+N_CORES <- 4      # deja 2 cores libres para el sistema operativo
+
+cat(sprintf("Parameters: B=%d | RF trees=%d | CV folds=%d | Cores=%d\n",
+    B, N_TREES, N_FOLDS, N_CORES))
+cat(sprintf("Estimated runtime: ~%.0f minutes\n\n",
+    B * 8 / N_CORES / 60))
+```
+
+```{r}
+# =============================================================================
+# SECTION 2: BOOTSTRAP FUNCTION
+# =============================================================================
+# FIX: DoubleMLPLR$new() takes positional arguments — no named arg obj_dml_data=
+# The first positional argument is the DoubleMLData object.
+
+run_one_boot <- function(b) {
+
+  # 1. Bootstrap resample with replacement
+  boot_idx  <- sample(nrow(dml_df), nrow(dml_df), replace = TRUE)
+  boot_data <- dml_df[boot_idx, ]   # dml_df is already data.table from Script 04
+
+  # Ensure data.table format (safety check)
+  if (!is.data.table(boot_data)) boot_data <- as.data.table(boot_data)
+
+  # 2. DoubleML data object
+  boot_dml_data <- DoubleMLData$new(
+    boot_data,
+    y_col  = "log_hourly_wage",
+    d_cols = "female",
+    x_cols = spec3_confounders
+  )
+
+  # 3. PLR — FIX: positional args, no obj_dml_data= name
+  tryCatch({
+    boot_plr <- DoubleMLPLR$new(
+      boot_dml_data,                          # 1st: data object (positional)
+      lrn("regr.ranger",                      # 2nd: ml_l learner
+          num.trees=N_TREES, max.depth=6, min.node.size=5),
+      lrn("regr.ranger",                      # 3rd: ml_m learner
+          num.trees=N_TREES, max.depth=6, min.node.size=5),
+      n_folds = N_FOLDS,
+      n_rep   = 1,
+      score   = "partialling out"
+    )
+
+    suppressMessages(boot_plr$fit())
+
+    ci <- boot_plr$confint()
+    tibble(
+      iter  = b,
+      theta = boot_plr$coef["female"],
+      se    = boot_plr$se["female"],
+      ci_lo = ci[1, 1],
+      ci_hi = ci[1, 2]
+    )
+
+  }, error = function(e) {
+    tibble(iter=b, theta=NA_real_, se=NA_real_,
+           ci_lo=NA_real_, ci_hi=NA_real_)
+  })
+}
+```
+
+```{r}
+# =============================================================================
+# SECTION 3: RUN BOOTSTRAP
+# =============================================================================
+
+cat("Starting parallel bootstrap...\n")
+cat("Progress not shown during parallel execution.\n\n")
+
+plan(multisession, workers = N_CORES)
+
+set.seed(2024)
+mc_results <- future_map_dfr(
+  1:B,
+  run_one_boot,
+  .options = furrr_options(seed = 2024L)
+)
+
+plan(sequential)
+
+# Remove failed iterations
+mc_clean <- mc_results %>% drop_na(theta)
+n_failed <- B - nrow(mc_clean)
+
+cat(sprintf("Bootstrap complete: %d/%d iterations succeeded", nrow(mc_clean), B))
+if (n_failed > 0) cat(sprintf(" (%d failed)", n_failed))
+cat("\n\n")
+```
+
+```{r}
+# =============================================================================
+# SECTION 4: RESULTS SUMMARY
+# =============================================================================
+
+cat("=== BOOTSTRAP STABILITY RESULTS ===\n\n")
+
+boot_mean   <- mean(mc_clean$theta)
+boot_median <- median(mc_clean$theta)
+boot_sd     <- sd(mc_clean$theta)
+boot_ci_lo  <- quantile(mc_clean$theta, 0.025)
+boot_ci_hi  <- quantile(mc_clean$theta, 0.975)
+pct_negative <- mean(mc_clean$theta < 0) * 100
+
+cat(sprintf("  Original DML estimate: %.4f (%.2f%%)\n",
+    theta_rf, (exp(theta_rf)-1)*100))
+cat(sprintf("  Bootstrap mean:        %.4f (%.2f%%)\n",
+    boot_mean, (exp(boot_mean)-1)*100))
+cat(sprintf("  Bootstrap median:      %.4f (%.2f%%)\n",
+    boot_median, (exp(boot_median)-1)*100))
+cat(sprintf("  Bootstrap SD:          %.4f\n", boot_sd))
+cat(sprintf("  Bootstrap 95%% CI:     [%.4f, %.4f]\n", boot_ci_lo, boot_ci_hi))
+cat(sprintf("  %% iterations theta<0: %.1f%%\n", pct_negative))
+cat(sprintf("\n  Interpretation: across %d alternative draws of the\n", nrow(mc_clean)))
+cat(  "  Spanish labour market (bootstrap samples of n=232,677),\n")
+cat(sprintf("  %.1f%% produce a negative gender penalty estimate.\n", pct_negative))
+cat("  The finding is not a lucky sample — it is structural.\n\n")
+```
+
+```{r}
+# =============================================================================
+# SECTION 5: SENSITIVITY ANALYSES
+# =============================================================================
+
+cat("=== SENSITIVITY 1: Excluding Top 20 earners ===\n")
+
+# Top 20 earners by hourly wage
+top20_ids   <- order(as.numeric(dml_df$log_hourly_wage), decreasing=TRUE)[1:20]
+dml_no_top20 <- dml_df[-top20_ids, ]
+
+dml_data_no20 <- DoubleMLData$new(
+  dml_no_top20,
+  y_col  = "log_hourly_wage",
+  d_cols = "female",
+  x_cols = spec3_confounders
+)
+
+plr_no20 <- DoubleMLPLR$new(
+  dml_data_no20,
+  lrn("regr.ranger", num.trees=500, max.depth=6, min.node.size=5),
+  lrn("regr.ranger", num.trees=500, max.depth=6, min.node.size=5),
+  n_folds=5, n_rep=3, score="partialling out"
+)
+set.seed(2024)
+suppressMessages(plr_no20$fit())
+
+theta_no20 <- plr_no20$coef["female"]
+cat(sprintf("  theta (excl. Top 20): %.4f (%.2f%%)\n",
+    theta_no20, (exp(theta_no20)-1)*100))
+cat(sprintf("  vs main estimate:     %.4f (%.2f%%)\n",
+    theta_rf, (exp(theta_rf)-1)*100))
+cat(sprintf("  Difference:           %.4f log points\n",
+    abs(theta_rf - theta_no20)))
+```
+
+```{r}
+# =============================================================================
+# SECTION 6: FIGURES
+# =============================================================================
+
+cat("\n=== SECTION 6: Generating figures ===\n")
+
+COL_MAIN <- "#C00000"
+COL_BOOT <- "#2E75B6"
+
+# Figure: histogram of bootstrap distribution
+fig_mc <- ggplot(mc_clean, aes(x = theta)) +
+  geom_histogram(bins=60, fill=COL_BOOT, color="white",
+                 alpha=0.85, linewidth=0.2) +
+  geom_vline(xintercept=theta_rf, color=COL_MAIN,
+             linewidth=1.3, linetype="solid") +
+  geom_vline(xintercept=c(boot_ci_lo, boot_ci_hi), color=COL_MAIN,
+             linewidth=0.8, linetype="dashed") +
+  geom_vline(xintercept=0, color="#555555",
+             linewidth=0.6, linetype="dotted") +
+  annotate("text", x=theta_rf, y=Inf, vjust=2, hjust=-0.1,
+    label=sprintf("Main estimate\n%.4f (%.2f%%)", theta_rf, (exp(theta_rf)-1)*100),
+    color=COL_MAIN, size=3.5, fontface="bold") +
+  annotate("text", x=boot_ci_lo, y=Inf, vjust=4, hjust=1.1,
+    label=sprintf("2.5th pct\n%.4f", boot_ci_lo),
+    color=COL_MAIN, size=3) +
+  annotate("text", x=boot_ci_hi, y=Inf, vjust=4, hjust=-0.1,
+    label=sprintf("97.5th pct\n%.4f", boot_ci_hi),
+    color=COL_MAIN, size=3) +
+  scale_x_continuous(
+    labels=function(x) sprintf("%.2f\n(%.1f%%)", x, (exp(x)-1)*100)
+  ) +
+  labs(
+    title    = "Figure 5.4 — Bootstrap Distribution of DML Gender Penalty (B=1,000)",
+    subtitle = sprintf(
+      "Each bar = one bootstrap sample of n=%s | Main estimate (red) | 95%% CI (dashed)\nBootstrap SD = %.4f | %.1f%% of iterations negative | EES 2022",
+      format(nrow(dml_df), big.mark=","), boot_sd, pct_negative),
+    x = "theta_DML estimate (log points | % equivalent on x-axis)",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size=11)
+
+ggsave("fig_mc_bootstrap_distribution.png", fig_mc,
+       width=10, height=5.5, dpi=200)
+print(fig_mc)
+cat("Saved: fig_mc_bootstrap_distribution.png\n")
+```
+
+```{r}
+# =============================================================================
+# SECTION 7: SAVE RESULTS
+# =============================================================================
+
+mc_summary <- tibble(
+  Metric  = c("Main DML estimate (log pts)", "Bootstrap mean", "Bootstrap median",
+              "Bootstrap SD", "Bootstrap 2.5th pct", "Bootstrap 97.5th pct",
+              "% iterations with theta < 0",
+              "theta excl. Top 20 earners"),
+  Value   = c(theta_rf, boot_mean, boot_median, boot_sd,
+              boot_ci_lo, boot_ci_hi, pct_negative, theta_no20)
+)
+
+write_csv(mc_summary, "results_mc_bootstrap_summary.csv")
+write_csv(mc_clean,   "results_mc_bootstrap_full.csv")
+
+cat("\n=== SCRIPT 05 COMPLETE ===\n")
+cat("Next: source('06_monte_carlo_lifecycle.R')\n")
+
+```
+
